@@ -1,0 +1,1396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nqtsu91 <55384628+Nqtsu91@users.noreply.github.com>
+Date: Thu, 2 Jul 2026 19:43:57 +0200
+Subject: [PATCH] Sukkit: snapshot API custom (dont EntityThornsEvent)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Snapshot du working tree des ajouts Sukkit côté API :
+events custom (PlayerReceiveDamageEvent, PotionAdded/Removed, FakePlayer*,
+PlayerArmorChange, EntityThornsEvent), PotionEfficiencyManager, LivingEntity.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 6e727d855493daeae6a2d8e649fad95ea25db1ce..ce30b34beb24c12c1c7806da8610e234b8c72541 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -64,6 +64,7 @@ tasks {
+     }
+ 
+     withType<Javadoc> {
++        isFailOnError = false // external javadoc.io links may be unreachable in offline/CI builds
+         (options as StandardJavadocDocletOptions).let {
+             // hide warnings
+             it.addBooleanOption("Xdoclint:none", true)
+diff --git a/src/main/java/org/bukkit/entity/LivingEntity.java b/src/main/java/org/bukkit/entity/LivingEntity.java
+index 48e2508941299ce55f672979ff85a2969fc1c64b..5d81ed49e72568b9d052c0042027a5fc8de8e011 100644
+--- a/src/main/java/org/bukkit/entity/LivingEntity.java
++++ b/src/main/java/org/bukkit/entity/LivingEntity.java
+@@ -302,6 +302,15 @@ public interface LivingEntity extends Entity, Damageable, ProjectileSource {
+      */
+     public boolean hasPotionEffect(PotionEffectType type);
+ 
++    /**
++     * Returns the active {@link PotionEffect} of the given type on this entity,
++     * or {@code null} if no effect of that type is currently active.
++     *
++     * @param type the potion type to look up
++     * @return the active PotionEffect, or null
++     */
++    public PotionEffect getPotionEffect(PotionEffectType type);
++
+     /**
+      * Removes any effects present of the given {@link PotionEffectType}.
+      *
+diff --git a/src/main/java/org/bukkit/event/entity/EntityThornsEvent.java b/src/main/java/org/bukkit/event/entity/EntityThornsEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e909ac71fbdd341359a0e0e078b0f391a1541c4c
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/entity/EntityThornsEvent.java
+@@ -0,0 +1,93 @@
++package org.bukkit.event.entity;
++
++import org.bukkit.entity.Entity;
++import org.bukkit.entity.LivingEntity;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.HandlerList;
++
++/**
++ * Fired when the Thorns enchantment on a defender's armor is about to reflect damage
++ * onto an attacker, exposing the activation chance and reflected damage so plugins can
++ * tune, disable, or force the effect per hit.
++ *
++ * <p>Defaults reproduce vanilla exactly (chance {@code 0.15 × level}, damage
++ * {@code level > 10 ? level - 10 : 1..4}); if no listener changes anything the behaviour
++ * is identical to unmodified Minecraft, so this event does not affect other plugins.
++ *
++ * <ul>
++ *   <li>{@link #setActivationChance(float)} — probability (0–1) that thorns triggers.</li>
++ *   <li>{@link #setReflectedDamage(float)} — damage dealt back to the attacker on trigger.</li>
++ *   <li>Cancelling skips thorns entirely for this hit (only armor durability is spent).</li>
++ * </ul>
++ */
++public class EntityThornsEvent extends EntityEvent implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++
++    private final Entity attacker;
++    private final int    level;
++    private float        activationChance;
++    private float        reflectedDamage;
++    private boolean      cancelled;
++
++    public EntityThornsEvent(LivingEntity defender, Entity attacker, int level,
++                             float activationChance, float reflectedDamage) {
++        super(defender);
++        this.attacker         = attacker;
++        this.level            = level;
++        this.activationChance = activationChance;
++        this.reflectedDamage  = reflectedDamage;
++    }
++
++    /** The entity wearing the Thorns armor (the one reflecting the damage). */
++    public LivingEntity getDefender() {
++        return (LivingEntity) entity;
++    }
++
++    /** The entity that would receive the reflected damage. May be {@code null}. */
++    public Entity getAttacker() {
++        return attacker;
++    }
++
++    /** The combined Thorns level across the defender's armor. */
++    public int getLevel() {
++        return level;
++    }
++
++    /** Probability in [0, 1] that Thorns triggers on this hit. */
++    public float getActivationChance() {
++        return activationChance;
++    }
++
++    public void setActivationChance(float activationChance) {
++        this.activationChance = Math.max(0f, Math.min(1f, activationChance));
++    }
++
++    /** Damage reflected back to the attacker when Thorns triggers. */
++    public float getReflectedDamage() {
++        return reflectedDamage;
++    }
++
++    public void setReflectedDamage(float reflectedDamage) {
++        this.reflectedDamage = Math.max(0f, reflectedDamage);
++    }
++
++    @Override
++    public boolean isCancelled() {
++        return cancelled;
++    }
++
++    @Override
++    public void setCancelled(boolean cancel) {
++        this.cancelled = cancel;
++    }
++
++    @Override
++    public HandlerList getHandlers() {
++        return handlers;
++    }
++
++    public static HandlerList getHandlerList() {
++        return handlers;
++    }
++}
+diff --git a/src/main/java/org/bukkit/event/entity/PlayerFatalHitEvent.java b/src/main/java/org/bukkit/event/entity/PlayerFatalHitEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..32d02efa877d832f1b6923f0d3cc331fdacd8018
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/entity/PlayerFatalHitEvent.java
+@@ -0,0 +1,109 @@
++package org.bukkit.event.entity;
++
++import org.bukkit.entity.Entity;
++import org.bukkit.entity.Player;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.HandlerList;
++import org.bukkit.event.player.PlayerEvent;
++
++/**
++ * Fired when a player's health would reach zero, just before {@code die()} is called.
++ *
++ * <p>Cancelling this event keeps the player alive at {@link #getSurvivalHealth()} HP.
++ * Works for all damage sources (melee, arrows, environment, void, etc.).</p>
++ *
++ * <p>This event fires after {@link PlayerReceiveDamageEvent} and after
++ * {@link org.bukkit.event.entity.EntityDamageEvent}. The full damage breakdown
++ * is available from those earlier events.</p>
++ *
++ * <p>Works whether the player is ALIVE (normal death) — plugins managing their own
++ * death system (e.g. WeebAPI) should cancel this event to handle the transition
++ * themselves instead of relying on {@link EntityDamageEvent} priority hacks.</p>
++ */
++public class PlayerFatalHitEvent extends PlayerEvent implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++
++    private boolean cancelled = false;
++
++    /**
++     * The entity that dealt the killing blow, or {@code null} for environmental causes
++     * (fall, void, drowning, etc.).
++     */
++    private final Entity killer;
++
++    /**
++     * The raw incoming damage value that reduced health to zero.
++     * This is the pre-reduction amount; the actual damage applied may be lower.
++     * Use {@link PlayerReceiveDamageEvent#getFinalDamage()} (fired earlier) for the
++     * post-reduction value.
++     */
++    private final float rawDamage;
++
++    /**
++     * Health the player will have if this event is cancelled.
++     * Default: 0.5F (¼ heart). Must be {@code > 0}.
++     */
++    private float survivalHealth = 0.5F;
++
++    public PlayerFatalHitEvent(Player player, Entity killer, float rawDamage) {
++        super(player);
++        this.killer = killer;
++        this.rawDamage = rawDamage;
++    }
++
++    /**
++     * Returns the entity responsible for the fatal hit, or {@code null} if the cause
++     * is environmental (void, poison, fire, fall, etc.).
++     */
++    public Entity getKiller() {
++        return killer;
++    }
++
++    /**
++     * Returns the raw (pre-reduction) damage that triggered this fatal hit.
++     */
++    public float getRawDamage() {
++        return rawDamage;
++    }
++
++    /**
++     * Returns the health the player will be set to if this event is cancelled.
++     * Default is {@code 0.5F}.
++     */
++    public float getSurvivalHealth() {
++        return survivalHealth;
++    }
++
++    /**
++     * Sets the health the player will have if this event is cancelled.
++     *
++     * @param health must be {@code > 0}
++     * @throws IllegalArgumentException if health ≤ 0
++     */
++    public void setSurvivalHealth(float health) {
++        if (health <= 0.0F) {
++            throw new IllegalArgumentException("survivalHealth must be > 0, got: " + health);
++        }
++        this.survivalHealth = health;
++    }
++
++    @Override
++    public boolean isCancelled() {
++        return cancelled;
++    }
++
++    @Override
++    public void setCancelled(boolean cancel) {
++        this.cancelled = cancel;
++    }
++
++    @Override
++    public HandlerList getHandlers() {
++        return handlers;
++    }
++
++    public static HandlerList getHandlerList() {
++        return handlers;
++    }
++}
+diff --git a/src/main/java/org/bukkit/event/entity/PlayerReceiveDamageEvent.java b/src/main/java/org/bukkit/event/entity/PlayerReceiveDamageEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..28a41aab7465e1b7364f45a2c598c8af921aa3bc
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/entity/PlayerReceiveDamageEvent.java
+@@ -0,0 +1,297 @@
++package org.bukkit.event.entity;
++
++import java.util.function.Supplier;
++import org.bukkit.entity.Entity;
++import org.bukkit.entity.Player;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.HandlerList;
++
++/**
++ * Fired when a player is about to receive damage, exposing every individual
++ * component of the damage calculation formula so that plugins can modify each
++ * value independently.
++ *
++ * <h3>Damage formula</h3>
++ * <pre>
++ *   finalDamage = rawIncomingDamage
++ *               - hardHatReduction
++ *               - blockingReduction
++ *               - armorReduction
++ *               - resistanceReduction
++ *               - magicReduction
++ *               - absorptionReduction
++ *   (result is clamped to 0)
++ * </pre>
++ *
++ * <h3>When the attacker is a player, extra read-only breakdown fields are available:</h3>
++ * <ul>
++ *   <li>{@link #getAttackerBaseDamage()} — raw attack attribute value (pre-crit)</li>
++ *   <li>{@link #getAttackerEnchantmentBonus()} — sharpness / smite / etc.</li>
++ *   <li>{@link #wasAttackerCritical()} — whether the hit was a crit</li>
++ *   <li>{@link #getAttackerCriticalMultiplier()} — crit multiplier (vanilla 1.5)</li>
++ *   <li>{@link #getAttackerKnockbackLevel()} — knockback level</li>
++ * </ul>
++ * These are informational; to change the effective incoming damage, set
++ * {@link #setRawIncomingDamage(float)} directly.
++ *
++ * <p>This event fires BEFORE {@link EntityDamageEvent}. If not cancelled, the
++ * (potentially modified) values are forwarded to {@code EntityDamageEvent} for
++ * further processing by other plugins.
++ */
++public class PlayerReceiveDamageEvent extends EntityEvent implements Cancellable {
++
++    /**
++     * Approximate body part that was struck, based on the height of the
++     * attacker's eyes relative to the victim's bounding box.
++     *
++     * <p>Only computed on the first call to {@link PlayerReceiveDamageEvent#getHitLocation()};
++     * {@code UNKNOWN} is returned when no attacker position is available.
++     */
++    public enum HitLocation {
++        HEAD,
++        TORSO,
++        LEGS,
++        FEET,
++        /** Returned when the hit location cannot be determined (no melee attacker, etc.). */
++        UNKNOWN
++    }
++
++    private static final HandlerList handlers = new HandlerList();
++    private boolean cancelled;
++
++    // Source
++    private final Entity source;
++
++    // ---- Attacker breakdown (read-only, only populated for player melee) ----
++    private final boolean fromPlayerAttack;
++    private final float attackerBaseDamage;
++    private final float attackerEnchantmentBonus;
++    private final boolean attackerCritical;
++    private final float attackerCriticalMultiplier;
++    private final int attackerKnockbackLevel;
++
++    // ---- Primary damage value ----
++    private float rawIncomingDamage;
++
++    // ---- Defense reductions (positive = amount absorbed, min 0) ----
++    private float hardHatReduction;
++    private float blockingReduction;
++    private float armorReduction;
++    private float resistanceReduction;
++    private float magicReduction;
++    private float absorptionReduction;
++
++    // ---- Hit location (lazy) ----
++    private final Supplier<HitLocation> hitLocationSupplier;
++    private HitLocation hitLocation = null;
++
++    public PlayerReceiveDamageEvent(Player victim,
++                                    Entity source,
++                                    float rawIncomingDamage,
++                                    float hardHatReduction,
++                                    float blockingReduction,
++                                    float armorReduction,
++                                    float resistanceReduction,
++                                    float magicReduction,
++                                    float absorptionReduction,
++                                    boolean fromPlayerAttack,
++                                    float attackerBaseDamage,
++                                    float attackerEnchantmentBonus,
++                                    boolean attackerCritical,
++                                    float attackerCriticalMultiplier,
++                                    int attackerKnockbackLevel,
++                                    Supplier<HitLocation> hitLocationSupplier) {
++        super(victim);
++        this.source                    = source;
++        this.rawIncomingDamage         = rawIncomingDamage;
++        this.hardHatReduction          = Math.max(0, hardHatReduction);
++        this.blockingReduction         = Math.max(0, blockingReduction);
++        this.armorReduction            = Math.max(0, armorReduction);
++        this.resistanceReduction       = Math.max(0, resistanceReduction);
++        this.magicReduction            = Math.max(0, magicReduction);
++        this.absorptionReduction       = Math.max(0, absorptionReduction);
++        this.fromPlayerAttack          = fromPlayerAttack;
++        this.attackerBaseDamage        = attackerBaseDamage;
++        this.attackerEnchantmentBonus  = attackerEnchantmentBonus;
++        this.attackerCritical          = attackerCritical;
++        this.attackerCriticalMultiplier = attackerCriticalMultiplier;
++        this.attackerKnockbackLevel    = attackerKnockbackLevel;
++        this.hitLocationSupplier       = hitLocationSupplier;
++    }
++
++    // -------------------------------------------------------------------------
++    // Entity / source
++    // -------------------------------------------------------------------------
++
++    @Override
++    public Player getEntity() {
++        return (Player) entity;
++    }
++
++    /**
++     * Returns the entity that dealt the damage, or {@code null} for
++     * environmental sources (fall damage, lava, etc.).
++     */
++    public Entity getSource() {
++        return source;
++    }
++
++    // -------------------------------------------------------------------------
++    // Attacker breakdown (read-only, only meaningful when fromPlayerAttack)
++    // -------------------------------------------------------------------------
++
++    /** Returns {@code true} if the damage originates from a direct player melee attack. */
++    public boolean isFromPlayerAttack() {
++        return fromPlayerAttack;
++    }
++
++    /**
++     * The attacker's raw attack-damage attribute value before the critical
++     * multiplier was applied.
++     * Only meaningful when {@link #isFromPlayerAttack()} is {@code true}.
++     */
++    public float getAttackerBaseDamage() {
++        return attackerBaseDamage;
++    }
++
++    /**
++     * The bonus damage added by weapon enchantments (Sharpness, Smite, etc.).
++     * Only meaningful when {@link #isFromPlayerAttack()} is {@code true}.
++     */
++    public float getAttackerEnchantmentBonus() {
++        return attackerEnchantmentBonus;
++    }
++
++    /**
++     * Whether the attack was a critical hit.
++     * Only meaningful when {@link #isFromPlayerAttack()} is {@code true}.
++     */
++    public boolean wasAttackerCritical() {
++        return attackerCritical;
++    }
++
++    /**
++     * The critical-hit multiplier applied to the base damage (vanilla: 1.5).
++     * Only meaningful when {@link #isFromPlayerAttack()} is {@code true}.
++     */
++    public float getAttackerCriticalMultiplier() {
++        return attackerCriticalMultiplier;
++    }
++
++    /**
++     * The knockback level on this hit (from enchantment + sprint bonus).
++     * Only meaningful when {@link #isFromPlayerAttack()} is {@code true}.
++     */
++    public int getAttackerKnockbackLevel() {
++        return attackerKnockbackLevel;
++    }
++
++    // -------------------------------------------------------------------------
++    // Primary incoming damage
++    // -------------------------------------------------------------------------
++
++    /**
++     * Returns the raw damage before any defensive reductions.
++     * For player attacks this equals {@code baseDamage × critMult + enchantBonus}.
++     */
++    public float getRawIncomingDamage() {
++        return rawIncomingDamage;
++    }
++
++    /**
++     * Overrides the raw incoming damage that feeds into all defense calculations.
++     * Set this to change how much damage the player effectively received before
++     * armor/resistance/etc. are applied.
++     *
++     * @param rawIncomingDamage non-negative raw damage value
++     */
++    public void setRawIncomingDamage(float rawIncomingDamage) {
++        this.rawIncomingDamage = Math.max(0, rawIncomingDamage);
++    }
++
++    // -------------------------------------------------------------------------
++    // Defense reductions
++    // -------------------------------------------------------------------------
++
++    /** Damage absorbed by the helmet when struck by an anvil or falling block. */
++    public float getHardHatReduction() { return hardHatReduction; }
++    public void setHardHatReduction(float v) { this.hardHatReduction = Math.max(0, v); }
++
++    /** Damage absorbed by blocking with a sword. */
++    public float getBlockingReduction() { return blockingReduction; }
++    public void setBlockingReduction(float v) { this.blockingReduction = Math.max(0, v); }
++
++    /** Damage absorbed by worn armor. */
++    public float getArmorReduction() { return armorReduction; }
++    public void setArmorReduction(float v) { this.armorReduction = Math.max(0, v); }
++
++    /** Damage absorbed by the Resistance potion effect. */
++    public float getResistanceReduction() { return resistanceReduction; }
++    public void setResistanceReduction(float v) { this.resistanceReduction = Math.max(0, v); }
++
++    /** Damage absorbed by Protection / Blast Protection / etc. enchantments. */
++    public float getMagicReduction() { return magicReduction; }
++    public void setMagicReduction(float v) { this.magicReduction = Math.max(0, v); }
++
++    /** Damage absorbed by Absorption hearts. */
++    public float getAbsorptionReduction() { return absorptionReduction; }
++    public void setAbsorptionReduction(float v) { this.absorptionReduction = Math.max(0, v); }
++
++    // -------------------------------------------------------------------------
++    // Final damage
++    // -------------------------------------------------------------------------
++
++    /**
++     * Returns the damage that will be applied to the player's health after all
++     * reductions.  This value is read-only; to change the outcome modify the
++     * individual components above.
++     */
++    public float getFinalDamage() {
++        return Math.max(0,
++                rawIncomingDamage
++                - hardHatReduction
++                - blockingReduction
++                - armorReduction
++                - resistanceReduction
++                - magicReduction
++                - absorptionReduction);
++    }
++
++    // -------------------------------------------------------------------------
++    // Hit location (lazy)
++    // -------------------------------------------------------------------------
++
++    /**
++     * Returns the approximate body part that was struck.
++     *
++     * <p>The value is computed on the <strong>first call</strong> to this method
++     * (using the attacker's eye height relative to the victim's bounding box) and
++     * then cached for subsequent calls.
++     *
++     * <p>Returns {@link HitLocation#UNKNOWN} when the damage has no positional
++     * attacker (fall damage, fire, etc.) or when no position data is available.
++     *
++     * @return the hit location, never {@code null}
++     */
++    public HitLocation getHitLocation() {
++        if (hitLocation == null) {
++            hitLocation = hitLocationSupplier.get();
++        }
++        return hitLocation;
++    }
++
++    // -------------------------------------------------------------------------
++    // Cancellable / HandlerList
++    // -------------------------------------------------------------------------
++
++    @Override
++    public boolean isCancelled() { return cancelled; }
++
++    @Override
++    public void setCancelled(boolean cancel) { this.cancelled = cancel; }
++
++    @Override
++    public HandlerList getHandlers() { return handlers; }
++
++    public static HandlerList getHandlerList() { return handlers; }
++}
+diff --git a/src/main/java/org/bukkit/event/entity/PotionAddedEvent.java b/src/main/java/org/bukkit/event/entity/PotionAddedEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..24f9650a54802d422cfceaa54796779e1b2bed0d
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/entity/PotionAddedEvent.java
+@@ -0,0 +1,75 @@
++package org.bukkit.event.entity;
++
++import org.bukkit.entity.Entity;
++import org.bukkit.entity.LivingEntity;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.HandlerList;
++import org.bukkit.potion.PotionEffect;
++
++/**
++ * Called when a potion effect is about to be added to a living entity.
++ * <p>
++ * Cancelling this event prevents the effect from being applied.
++ */
++public class PotionAddedEvent extends EntityEvent implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++    private boolean cancelled;
++    private final PotionEffect effect;
++    private final Entity source;
++
++    /**
++     * @param entity the entity receiving the effect
++     * @param effect the potion effect being applied
++     * @param source the entity responsible for applying the effect, or null
++     *               (e.g. beacon, command, or plugin)
++     */
++    public PotionAddedEvent(LivingEntity entity, PotionEffect effect, Entity source) {
++        super(entity);
++        this.effect = effect;
++        this.source = source;
++    }
++
++    @Override
++    public LivingEntity getEntity() {
++        return (LivingEntity) entity;
++    }
++
++    /**
++     * Returns the potion effect that will be applied.
++     *
++     * @return the {@link PotionEffect}
++     */
++    public PotionEffect getEffect() {
++        return effect;
++    }
++
++    /**
++     * Returns the entity that caused this effect to be applied, or null if
++     * the source is non-entity (beacon, command, plugin API, etc.).
++     *
++     * @return the source {@link Entity}, or null
++     */
++    public Entity getSource() {
++        return source;
++    }
++
++    @Override
++    public boolean isCancelled() {
++        return cancelled;
++    }
++
++    @Override
++    public void setCancelled(boolean cancel) {
++        this.cancelled = cancel;
++    }
++
++    @Override
++    public HandlerList getHandlers() {
++        return handlers;
++    }
++
++    public static HandlerList getHandlerList() {
++        return handlers;
++    }
++}
+diff --git a/src/main/java/org/bukkit/event/entity/PotionRemovedEvent.java b/src/main/java/org/bukkit/event/entity/PotionRemovedEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..88fff733015faa92df165bcb928f7e39c6c65c65
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/entity/PotionRemovedEvent.java
+@@ -0,0 +1,52 @@
++package org.bukkit.event.entity;
++
++import org.bukkit.entity.LivingEntity;
++import org.bukkit.event.HandlerList;
++import org.bukkit.potion.PotionEffect;
++
++/**
++ * Called after a potion effect has been removed from a living entity,
++ * either because it expired naturally or was removed programmatically.
++ * <p>
++ * The effect has already been removed from the entity when this event fires.
++ * {@link #getEffect()} reflects the state of the effect at the moment of removal
++ * (e.g. remaining duration is 0 for natural expiry).
++ */
++public class PotionRemovedEvent extends EntityEvent {
++
++    private static final HandlerList handlers = new HandlerList();
++    private final PotionEffect effect;
++
++    /**
++     * @param entity the entity that lost the effect
++     * @param effect the potion effect that was removed
++     */
++    public PotionRemovedEvent(LivingEntity entity, PotionEffect effect) {
++        super(entity);
++        this.effect = effect;
++    }
++
++    @Override
++    public LivingEntity getEntity() {
++        return (LivingEntity) entity;
++    }
++
++    /**
++     * Returns the potion effect that was removed, with its state at the time
++     * of removal (remaining duration may be 0 if it expired naturally).
++     *
++     * @return the removed {@link PotionEffect}
++     */
++    public PotionEffect getEffect() {
++        return effect;
++    }
++
++    @Override
++    public HandlerList getHandlers() {
++        return handlers;
++    }
++
++    public static HandlerList getHandlerList() {
++        return handlers;
++    }
++}
+diff --git a/src/main/java/org/bukkit/event/fakeplayer/FakePlayerAttackEvent.java b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerAttackEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..fafa719aff69032f28fedf5c7d07d8a45cd3495f
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerAttackEvent.java
+@@ -0,0 +1,40 @@
++package org.bukkit.event.fakeplayer;
++
++import org.bukkit.entity.LivingEntity;
++import org.bukkit.entity.Player;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.Event;
++import org.bukkit.event.HandlerList;
++
++/**
++ * Fired when a FakePlayer's AI is about to execute a melee swing at its target.
++ *
++ * <p>Cancelling this event suppresses both the arm-swing animation and the
++ * {@code attack()} call — no damage is dealt and no knockback is applied.
++ * The attack cooldown is NOT reset when cancelled, so the bot will attempt
++ * again on the next eligible tick.</p>
++ */
++public class FakePlayerAttackEvent extends Event implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++    private boolean cancelled;
++
++    private final Player      fakePlayer;
++    private final LivingEntity target;
++
++    public FakePlayerAttackEvent(Player fakePlayer, LivingEntity target) {
++        this.fakePlayer = fakePlayer;
++        this.target     = target;
++    }
++
++    /** Returns the FakePlayer that is about to swing. */
++    public Player getFakePlayer() { return fakePlayer; }
++
++    /** Returns the entity that the FakePlayer is targeting. */
++    public LivingEntity getTarget() { return target; }
++
++    @Override public boolean isCancelled()           { return cancelled; }
++    @Override public void    setCancelled(boolean c) { this.cancelled = c; }
++    @Override public HandlerList getHandlers()       { return handlers; }
++    public static  HandlerList   getHandlerList()    { return handlers; }
++}
+diff --git a/src/main/java/org/bukkit/event/fakeplayer/FakePlayerDamagedEvent.java b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerDamagedEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3b5af90498e1b9f8f5b1b6218d5f3b75b6f2a11
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerDamagedEvent.java
+@@ -0,0 +1,58 @@
++package org.bukkit.event.fakeplayer;
++
++import org.bukkit.entity.Entity;
++import org.bukkit.entity.Player;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.Event;
++import org.bukkit.event.HandlerList;
++
++/**
++ * Fired when a FakePlayer is about to take damage from any source.
++ *
++ * <p>The raw {@link #getDamage()} value is the damage <em>before</em> any
++ * armor, resistance, or absorption reductions.  Modifying it via
++ * {@link #setDamage(float)} adjusts what reaches the full damage pipeline.</p>
++ *
++ * <p>Cancelling this event prevents the damage entirely (the FakePlayer
++ * takes 0 damage and no knockback is applied).</p>
++ */
++public class FakePlayerDamagedEvent extends Event implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++    private boolean cancelled;
++
++    private final Player fakePlayer;
++    private float        damage;
++    /** Entity that dealt the damage, or {@code null} for environmental sources. */
++    private final Entity attacker;
++
++    public FakePlayerDamagedEvent(Player fakePlayer, float damage, Entity attacker) {
++        this.fakePlayer = fakePlayer;
++        this.damage     = Math.max(0, damage);
++        this.attacker   = attacker;
++    }
++
++    /** Returns the FakePlayer that is about to take damage. */
++    public Player getFakePlayer() { return fakePlayer; }
++
++    /** Returns the raw incoming damage value (before defense reductions). */
++    public float getDamage() { return damage; }
++
++    /**
++     * Overrides the raw incoming damage value fed into the defense pipeline.
++     *
++     * @param damage non-negative value; clamped to 0 if negative
++     */
++    public void setDamage(float damage) { this.damage = Math.max(0, damage); }
++
++    /**
++     * Returns the entity that dealt the damage, or {@code null} for
++     * environmental sources (fall, fire, void, etc.).
++     */
++    public Entity getAttacker() { return attacker; }
++
++    @Override public boolean isCancelled()           { return cancelled; }
++    @Override public void    setCancelled(boolean c) { this.cancelled = c; }
++    @Override public HandlerList getHandlers()       { return handlers; }
++    public static  HandlerList   getHandlerList()    { return handlers; }
++}
+diff --git a/src/main/java/org/bukkit/event/fakeplayer/FakePlayerDeathEvent.java b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerDeathEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4345c6eabdd4231cd52cb22bc4b8090cb05fd8d7
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerDeathEvent.java
+@@ -0,0 +1,43 @@
++package org.bukkit.event.fakeplayer;
++
++import org.bukkit.entity.Entity;
++import org.bukkit.entity.Player;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.Event;
++import org.bukkit.event.HandlerList;
++
++/**
++ * Fired when a FakePlayer is about to die.
++ *
++ * <p>Cancelling this event prevents death: the FakePlayer remains alive with
++ * whatever health it currently has.  Plugins that cancel this event should
++ * restore HP to avoid an instant-death loop on the next tick.</p>
++ */
++public class FakePlayerDeathEvent extends Event implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++    private boolean cancelled;
++
++    private final Player fakePlayer;
++    /** The entity that dealt the killing blow, or {@code null} for environmental causes. */
++    private final Entity killer;
++
++    public FakePlayerDeathEvent(Player fakePlayer, Entity killer) {
++        this.fakePlayer = fakePlayer;
++        this.killer     = killer;
++    }
++
++    /** Returns the FakePlayer that is about to die. */
++    public Player getFakePlayer() { return fakePlayer; }
++
++    /**
++     * Returns the entity that dealt the killing blow, or {@code null} if the
++     * cause was environmental (fall damage, fire, void, etc.).
++     */
++    public Entity getKiller() { return killer; }
++
++    @Override public boolean isCancelled()           { return cancelled; }
++    @Override public void    setCancelled(boolean c) { this.cancelled = c; }
++    @Override public HandlerList getHandlers()       { return handlers; }
++    public static  HandlerList   getHandlerList()    { return handlers; }
++}
+diff --git a/src/main/java/org/bukkit/event/fakeplayer/FakePlayerEatEvent.java b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerEatEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d5ade288986e7fadcd54e49f4fe0e43e61d3c38
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerEatEvent.java
+@@ -0,0 +1,47 @@
++package org.bukkit.event.fakeplayer;
++
++import org.bukkit.entity.Player;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.Event;
++import org.bukkit.event.HandlerList;
++
++/**
++ * Fired when a FakePlayer is about to begin eating a golden apple.
++ *
++ * <p>This event fires at the <em>start</em> of the eating sequence (before the
++ * 32-tick animation begins), not when effects are applied.  Cancelling it
++ * prevents the eat entirely — no animation plays, no golden apple is consumed,
++ * and the stock count is unchanged.</p>
++ */
++public class FakePlayerEatEvent extends Event implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++    private boolean cancelled;
++
++    private final Player fakePlayer;
++    /**
++     * Number of golden apples that will remain after this eat completes
++     * (i.e. current count − 1).
++     */
++    private final int gapplesRemaining;
++
++    public FakePlayerEatEvent(Player fakePlayer, int gapplesRemaining) {
++        this.fakePlayer       = fakePlayer;
++        this.gapplesRemaining = gapplesRemaining;
++    }
++
++    /** Returns the FakePlayer that is about to eat. */
++    public Player getFakePlayer() { return fakePlayer; }
++
++    /**
++     * Returns how many golden apples will remain after this eat completes
++     * (current count − 1).  If the event is cancelled, the count stays at
++     * {@code gapplesRemaining + 1}.
++     */
++    public int getGapplesRemaining() { return gapplesRemaining; }
++
++    @Override public boolean isCancelled()           { return cancelled; }
++    @Override public void    setCancelled(boolean c) { this.cancelled = c; }
++    @Override public HandlerList getHandlers()       { return handlers; }
++    public static  HandlerList   getHandlerList()    { return handlers; }
++}
+diff --git a/src/main/java/org/bukkit/event/fakeplayer/FakePlayerEffectEvent.java b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerEffectEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff302d74b4cbd240de3f9382aeac753b94a59120
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerEffectEvent.java
+@@ -0,0 +1,40 @@
++package org.bukkit.event.fakeplayer;
++
++import org.bukkit.entity.Player;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.Event;
++import org.bukkit.event.HandlerList;
++import org.bukkit.potion.PotionEffect;
++
++/**
++ * Fired when any potion effect is about to be added to a FakePlayer.
++ *
++ * <p>This event fires for <em>all</em> effect additions regardless of source
++ * (golden apple self-heal, plugin calls, etc.) and precedes the vanilla
++ * {@link org.bukkit.event.entity.PotionAddedEvent}.  Cancelling it prevents
++ * the effect from being applied.</p>
++ */
++public class FakePlayerEffectEvent extends Event implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++    private boolean cancelled;
++
++    private final Player      fakePlayer;
++    private final PotionEffect effect;
++
++    public FakePlayerEffectEvent(Player fakePlayer, PotionEffect effect) {
++        this.fakePlayer = fakePlayer;
++        this.effect     = effect;
++    }
++
++    /** Returns the FakePlayer that is about to receive the effect. */
++    public Player getFakePlayer() { return fakePlayer; }
++
++    /** Returns the potion effect about to be applied. */
++    public PotionEffect getEffect() { return effect; }
++
++    @Override public boolean isCancelled()           { return cancelled; }
++    @Override public void    setCancelled(boolean c) { this.cancelled = c; }
++    @Override public HandlerList getHandlers()       { return handlers; }
++    public static  HandlerList   getHandlerList()    { return handlers; }
++}
+diff --git a/src/main/java/org/bukkit/event/fakeplayer/FakePlayerKillEvent.java b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerKillEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4486b7e7948fe2bfa038fa25f223d13059601436
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerKillEvent.java
+@@ -0,0 +1,35 @@
++package org.bukkit.event.fakeplayer;
++
++import org.bukkit.entity.LivingEntity;
++import org.bukkit.entity.Player;
++import org.bukkit.event.Event;
++import org.bukkit.event.HandlerList;
++
++/**
++ * Fired when a FakePlayer's melee attack delivers the killing blow to an entity.
++ *
++ * <p>This event is <strong>not cancellable</strong> — the kill has already
++ * occurred by the time it fires.  Use {@link FakePlayerAttackEvent} to
++ * intercept attacks before they land.</p>
++ */
++public class FakePlayerKillEvent extends Event {
++
++    private static final HandlerList handlers = new HandlerList();
++
++    private final Player      fakePlayer;
++    private final LivingEntity victim;
++
++    public FakePlayerKillEvent(Player fakePlayer, LivingEntity victim) {
++        this.fakePlayer = fakePlayer;
++        this.victim     = victim;
++    }
++
++    /** Returns the FakePlayer that made the kill. */
++    public Player getFakePlayer() { return fakePlayer; }
++
++    /** Returns the entity that was killed. */
++    public LivingEntity getVictim() { return victim; }
++
++    @Override public HandlerList getHandlers()    { return handlers; }
++    public static  HandlerList   getHandlerList() { return handlers; }
++}
+diff --git a/src/main/java/org/bukkit/event/fakeplayer/FakePlayerSpawnEvent.java b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerSpawnEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb216a8080f73152f42509d8153608dcc16ff102
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/fakeplayer/FakePlayerSpawnEvent.java
+@@ -0,0 +1,38 @@
++package org.bukkit.event.fakeplayer;
++
++import org.bukkit.Location;
++import org.bukkit.entity.Player;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.Event;
++import org.bukkit.event.HandlerList;
++
++/**
++ * Fired immediately before a FakePlayer entity is added to the world.
++ *
++ * <p>Cancelling this event prevents the spawn: {@link FakePlayerManager#spawn}
++ * will return {@code null} and the entity will not be registered.</p>
++ */
++public class FakePlayerSpawnEvent extends Event implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++    private boolean cancelled;
++
++    private final Player   fakePlayer;
++    private final Location location;
++
++    public FakePlayerSpawnEvent(Player fakePlayer, Location location) {
++        this.fakePlayer = fakePlayer;
++        this.location   = location.clone();
++    }
++
++    /** Returns the FakePlayer that is about to be spawned. */
++    public Player getFakePlayer() { return fakePlayer; }
++
++    /** Returns the location at which the FakePlayer will spawn. */
++    public Location getLocation() { return location.clone(); }
++
++    @Override public boolean isCancelled()             { return cancelled; }
++    @Override public void    setCancelled(boolean c)   { this.cancelled = c; }
++    @Override public HandlerList getHandlers()         { return handlers; }
++    public static  HandlerList   getHandlerList()      { return handlers; }
++}
+diff --git a/src/main/java/org/bukkit/event/player/PlayerArmorChangeEvent.java b/src/main/java/org/bukkit/event/player/PlayerArmorChangeEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8970f5b85a664ccaedb7ac75af509b2b9ad3e25d
+--- /dev/null
++++ b/src/main/java/org/bukkit/event/player/PlayerArmorChangeEvent.java
+@@ -0,0 +1,141 @@
++package org.bukkit.event.player;
++
++import org.bukkit.entity.Player;
++import org.bukkit.event.Cancellable;
++import org.bukkit.event.HandlerList;
++import org.bukkit.inventory.ItemStack;
++
++/**
++ * Fired when a player's armor inventory changes — equip, unequip, slot swap, break, or death.
++ *
++ * <h3>Cancellation</h3>
++ * Cancellable for {@link ChangeReason#PLAYER} and {@link ChangeReason#PLUGIN} only.
++ * {@link ChangeReason#BREAK} and {@link ChangeReason#DEATH} are purely informational and
++ * cannot be cancelled (the change has already been committed).
++ *
++ * <h3>WeebBinding</h3>
++ * Items with the {@code WeebBinding} NBT byte set to 1 are never removable by the player
++ * ({@link ChangeReason#PLAYER} change is silently blocked before this event fires).
++ * They can still be replaced by plugin code ({@link ChangeReason#PLUGIN}) and are
++ * naturally removed on break ({@link ChangeReason#BREAK}) or death ({@link ChangeReason#DEATH}).
++ *
++ * <h3>WeebEffects NBT format</h3>
++ * Armor items may carry a {@code WeebEffects} NBT list of the form:
++ * <pre>
++ * WeebEffects: [
++ *   { Id: 1b, Amplifier: 0b }   // Speed I
++ *   { Id: 5b, Amplifier: 1b }   // Strength II
++ * ]
++ * </pre>
++ * Effects are applied automatically to the wearing player and removed when the armor is
++ * no longer equipped.
++ */
++public class PlayerArmorChangeEvent extends PlayerEvent implements Cancellable {
++
++    private static final HandlerList handlers = new HandlerList();
++
++    // -------------------------------------------------------------------------
++    // Nested enums
++    // -------------------------------------------------------------------------
++
++    /**
++     * Which armor slot changed.
++     * The {@link #getIndex()} value matches {@code PlayerInventory.armor[index]}.
++     */
++    public enum Slot {
++        BOOTS(0), LEGGINGS(1), CHESTPLATE(2), HELMET(3);
++
++        private final int index;
++
++        Slot(int index) { this.index = index; }
++
++        /** Raw index into {@code PlayerInventory.armor[]}. */
++        public int getIndex() { return index; }
++
++        public static Slot fromIndex(int index) {
++            for (Slot s : values()) {
++                if (s.index == index) return s;
++            }
++            throw new IllegalArgumentException("Invalid armor index: " + index);
++        }
++    }
++
++    public enum ChangeReason {
++        /**
++         * The player manually moved the item via the inventory UI (drag, shift-click, etc.).
++         * Cancellable. WeebBinding is enforced before this event fires.
++         */
++        PLAYER,
++
++        /**
++         * Set programmatically via a plugin or WeebAPI internal call.
++         * Cancellable. WeebBinding is NOT enforced (plugin has higher authority).
++         */
++        PLUGIN,
++
++        /**
++         * Armor durability reached 0. The slot has already been cleared.
++         * Not cancellable — the change is already committed.
++         */
++        BREAK,
++
++        /**
++         * Player died and the inventory was cleared.
++         * Not cancellable — the change is already committed.
++         */
++        DEATH
++    }
++
++    // -------------------------------------------------------------------------
++    // Instance fields
++    // -------------------------------------------------------------------------
++
++    private final Slot          slot;
++    private final ItemStack     oldItem;   // may be null
++    private final ItemStack     newItem;   // may be null
++    private final ChangeReason  reason;
++    private       boolean       cancelled = false;
++
++    public PlayerArmorChangeEvent(Player player, Slot slot,
++                                  ItemStack oldItem, ItemStack newItem,
++                                  ChangeReason reason) {
++        super(player);
++        this.slot    = slot;
++        this.oldItem = oldItem;
++        this.newItem = newItem;
++        this.reason  = reason;
++    }
++
++    // -------------------------------------------------------------------------
++    // Accessors
++    // -------------------------------------------------------------------------
++
++    public Slot         getSlot()    { return slot; }
++    /** Item that was in the slot before the change, or {@code null} if the slot was empty. */
++    public ItemStack    getOldItem() { return oldItem; }
++    /** Item that will occupy the slot after the change, or {@code null} if the slot is being emptied. */
++    public ItemStack    getNewItem() { return newItem; }
++    public ChangeReason getReason()  { return reason; }
++
++    // -------------------------------------------------------------------------
++    // Cancellable
++    // -------------------------------------------------------------------------
++
++    @Override
++    public boolean isCancelled() { return cancelled; }
++
++    @Override
++    public void setCancelled(boolean cancel) {
++        // BREAK and DEATH are committed before the event fires — cancellation is a no-op
++        if (reason == ChangeReason.BREAK || reason == ChangeReason.DEATH) return;
++        this.cancelled = cancel;
++    }
++
++    // -------------------------------------------------------------------------
++    // HandlerList (required by Bukkit)
++    // -------------------------------------------------------------------------
++
++    @Override
++    public HandlerList getHandlers()            { return handlers; }
++    public static HandlerList getHandlerList()  { return handlers; }
++}
+diff --git a/src/main/java/org/bukkit/potion/PotionEfficiencyManager.java b/src/main/java/org/bukkit/potion/PotionEfficiencyManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1df89b36e4a946b808ffd16662e3fc01c2bf6b2
+--- /dev/null
++++ b/src/main/java/org/bukkit/potion/PotionEfficiencyManager.java
+@@ -0,0 +1,198 @@
++package org.bukkit.potion;
++
++import java.util.Map;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Manages per-player and global efficiency values for potion effects.
++ *
++ * <p>The efficiency is a <strong>raw value per amplifier level</strong> that replaces
++ * the vanilla coefficient for that effect. For example:
++ * <ul>
++ *   <li>{@code setGlobalEfficiency(DAMAGE_RESISTANCE, 0.2)} → each level of Resistance
++ *       reduces damage by 20% (Resistance I = 20%, Resistance II = 40%). This is vanilla.</li>
++ *   <li>{@code setGlobalEfficiency(DAMAGE_RESISTANCE, 0.5)} → Resistance I = 50% reduction.</li>
++ *   <li>{@code setPlayerEfficiency(uuid, DAMAGE_RESISTANCE, 0.1)} → that player only gets
++ *       10% reduction per level regardless of the global setting.</li>
++ * </ul>
++ *
++ * <p>When no efficiency is configured for a given (player, effect) pair the vanilla formula
++ * is used unchanged. The resolution order is:
++ * <ol>
++ *   <li>Player-specific override (if set)</li>
++ *   <li>Global override (if set)</li>
++ *   <li>{@code null} → vanilla behaviour</li>
++ * </ol>
++ *
++ * <p>Reference: vanilla per-level coefficients
++ * <pre>
++ *  DAMAGE_RESISTANCE  0.20  (20 % reduction per level)
++ *  SPEED              0.20  (movement speed per level)
++ *  SLOW               0.15  (movement speed reduction per level)
++ *  FAST_DIGGING       0.20  (dig speed fraction added per level)
++ *  SLOW_DIGGING       0.30  (dig speed multiplied by 0.3^(level))
++ *  INCREASE_DAMAGE    2.50  (attack damage attribute per level, op=2)
++ *  WEAKNESS           2.00  (attack damage reduction per level, op=0)
++ *  HEALTH_BOOST       4.00  (max health added per level)
++ *  ABSORPTION         4.00  (absorption hearts per level)
++ *  REGENERATION       1.00  (HP healed per tick per level)
++ *  POISON             1.00  (HP damaged per tick per level)
++ *  WITHER             1.00  (HP damaged per tick per level)
++ *  HEAL               4.00  (HP healed per application per level, instant)
++ *  HARM               6.00  (HP damaged per application per level, instant)
++ *  JUMP               0.10  (extra motY per level)
++ *  HUNGER             0.025 (exhaustion per tick per level)
++ *  SATURATION         1.00  (food levels restored per tick per level)
++ * </pre>
++ *
++ * <p>Thread-safe.
++ */
++public final class PotionEfficiencyManager {
++
++    private static final Map<Integer, Double> globalEfficiencies = new ConcurrentHashMap<>();
++    private static final Map<UUID, Map<Integer, Double>> playerEfficiencies = new ConcurrentHashMap<>();
++
++    private PotionEfficiencyManager() {}
++
++    // -------------------------------------------------------------------------
++    // Global
++    // -------------------------------------------------------------------------
++
++    /**
++     * Sets the global efficiency for an effect type.
++     * This value applies to all entities that do not have a player-specific override.
++     *
++     * @param type       the effect type
++     * @param efficiency raw value per amplifier level (see class javadoc for units)
++     */
++    public static void setGlobalEfficiency(PotionEffectType type, double efficiency) {
++        globalEfficiencies.put(type.getId(), efficiency);
++    }
++
++    /**
++     * Returns the configured global efficiency, or {@code null} if none is set
++     * (meaning vanilla behaviour will be used).
++     *
++     * @param type the effect type
++     * @return the global efficiency, or {@code null}
++     */
++    public static Double getGlobalEfficiency(PotionEffectType type) {
++        return globalEfficiencies.get(type.getId());
++    }
++
++    /**
++     * Removes the global efficiency override for an effect type, restoring vanilla behaviour
++     * for all entities that do not have a player-specific override.
++     *
++     * @param type the effect type
++     */
++    public static void clearGlobalEfficiency(PotionEffectType type) {
++        globalEfficiencies.remove(type.getId());
++    }
++
++    // -------------------------------------------------------------------------
++    // Per-player
++    // -------------------------------------------------------------------------
++
++    /**
++     * Sets a player-specific efficiency override for an effect type.
++     * Takes priority over the global setting for that player.
++     *
++     * @param playerUuid the UUID of the player
++     * @param type       the effect type
++     * @param efficiency raw value per amplifier level
++     */
++    public static void setPlayerEfficiency(UUID playerUuid, PotionEffectType type, double efficiency) {
++        playerEfficiencies
++                .computeIfAbsent(playerUuid, k -> new ConcurrentHashMap<>())
++                .put(type.getId(), efficiency);
++    }
++
++    /**
++     * Returns the player-specific efficiency override, or {@code null} if none is set.
++     * Does NOT fall back to the global value.
++     *
++     * @param playerUuid the UUID of the player
++     * @param type       the effect type
++     * @return the player override, or {@code null}
++     */
++    public static Double getPlayerEfficiency(UUID playerUuid, PotionEffectType type) {
++        Map<Integer, Double> map = playerEfficiencies.get(playerUuid);
++        return (map != null) ? map.get(type.getId()) : null;
++    }
++
++    /**
++     * Removes the player-specific override for one effect type.
++     * The player will then fall back to the global efficiency (or vanilla).
++     *
++     * @param playerUuid the UUID of the player
++     * @param type       the effect type
++     */
++    public static void clearPlayerEfficiency(UUID playerUuid, PotionEffectType type) {
++        Map<Integer, Double> map = playerEfficiencies.get(playerUuid);
++        if (map != null) {
++            map.remove(type.getId());
++            if (map.isEmpty()) {
++                playerEfficiencies.remove(playerUuid);
++            }
++        }
++    }
++
++    /**
++     * Removes all player-specific overrides for a player.
++     * Call this when the player disconnects to avoid memory leaks.
++     *
++     * @param playerUuid the UUID of the player
++     */
++    public static void clearPlayerEfficiencies(UUID playerUuid) {
++        playerEfficiencies.remove(playerUuid);
++    }
++
++    /**
++     * Returns {@code true} if the player has at least one override set.
++     *
++     * @param playerUuid the UUID of the player
++     */
++    public static boolean hasPlayerOverride(UUID playerUuid) {
++        Map<Integer, Double> map = playerEfficiencies.get(playerUuid);
++        return map != null && !map.isEmpty();
++    }
++
++    // -------------------------------------------------------------------------
++    // Resolution (used internally by NMS)
++    // -------------------------------------------------------------------------
++
++    /**
++     * Resolves the effective efficiency for a (player UUID, effect ID) pair.
++     *
++     * <p>Returns {@code null} when neither a player override nor a global value is
++     * configured, signalling NMS code to fall back to the unmodified vanilla formula.
++     *
++     * @param playerUuid UUID of the entity; pass {@code null} for non-player entities
++     *                   (player overrides are then skipped, global still applies)
++     * @param effectId   NMS potion effect ID
++     * @return the resolved efficiency, or {@code null} for vanilla behaviour
++     */
++    public static Double getEfficiencyById(UUID playerUuid, int effectId) {
++        if (playerUuid != null) {
++            Map<Integer, Double> map = playerEfficiencies.get(playerUuid);
++            if (map != null) {
++                Double val = map.get(effectId);
++                if (val != null) {
++                    return val;
++                }
++            }
++        }
++        return globalEfficiencies.get(effectId);
++    }
++
++    /**
++     * Convenience overload using a {@link PotionEffectType}.
++     *
++     * @see #getEfficiencyById(UUID, int)
++     */
++    public static Double getEfficiency(UUID playerUuid, PotionEffectType type) {
++        return getEfficiencyById(playerUuid, type.getId());
++    }
++}

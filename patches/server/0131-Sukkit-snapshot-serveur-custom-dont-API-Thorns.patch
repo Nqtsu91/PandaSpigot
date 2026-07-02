@@ -1,0 +1,3145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nqtsu91 <55384628+Nqtsu91@users.noreply.github.com>
+Date: Thu, 2 Jul 2026 19:43:57 +0200
+Subject: [PATCH] Sukkit: snapshot serveur custom (dont API Thorns)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Snapshot du working tree des ajouts Sukkit côté serveur : FakePlayer,
+PlayerReceiveDamage/Potion/enchant hooks, et l'API Thorns
+(EnchantmentThorns.b fire EntityThornsEvent via CraftEventFactory).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/src/main/java/net/minecraft/server/EnchantmentThorns.java b/src/main/java/net/minecraft/server/EnchantmentThorns.java
+index 913e5e4451674b438e18fbb3aac13295202c23e1..b979620cee6776940a38897dc25cf7376f949472 100644
+--- a/src/main/java/net/minecraft/server/EnchantmentThorns.java
++++ b/src/main/java/net/minecraft/server/EnchantmentThorns.java
+@@ -29,14 +29,23 @@ public class EnchantmentThorns extends Enchantment {
+         Random random = entityliving.bc();
+         ItemStack itemstack = EnchantmentManager.a(Enchantment.THORNS, entityliving);
+ 
+-        if (entity != null && a(i, random)) { // CraftBukkit
+-            if (entity != null) {
+-                entity.damageEntity(DamageSource.a(entityliving), (float) b(i, random));
++        if (entity != null) {
++            // Sukkit: expose thorns activation chance + reflected damage via a cancellable
++            // event. Defaults mirror vanilla (chance 0.15*level, damage b(i)), so unmodified
++            // behaviour is byte-for-byte identical for plugins that don't listen.
++            float chance = 0.15F * (float) i;
++            float damage = (float) b(i, random);
++            org.bukkit.event.entity.EntityThornsEvent event =
++                    org.bukkit.craftbukkit.event.CraftEventFactory.callEntityThornsEvent(entityliving, entity, i, chance, damage);
++
++            if (!event.isCancelled() && random.nextFloat() < event.getActivationChance()) {
++                entity.damageEntity(DamageSource.a(entityliving), event.getReflectedDamage());
+                 entity.makeSound("damage.thorns", 0.5F, 1.0F);
+-            }
+-
+-            if (itemstack != null) {
+-                itemstack.damage(3, entityliving);
++                if (itemstack != null) {
++                    itemstack.damage(3, entityliving);
++                }
++            } else if (itemstack != null) {
++                itemstack.damage(1, entityliving);
+             }
+         } else if (itemstack != null) {
+             itemstack.damage(1, entityliving);
+diff --git a/src/main/java/net/minecraft/server/EntityFakePlayer.java b/src/main/java/net/minecraft/server/EntityFakePlayer.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a969ffdf4b74241d35fc54fa84f03b0ef117ee83
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/EntityFakePlayer.java
+@@ -0,0 +1,1426 @@
++package net.minecraft.server;
++
++import com.mojang.authlib.GameProfile;
++import com.mojang.authlib.properties.Property;
++import java.nio.charset.StandardCharsets;
++import java.util.Base64;
++import java.util.UUID;
++
++/**
++ * A server-controlled {@link EntityPlayer} entity that acts as a lightweight
++ * NPC or combat bot.
++ *
++ * <h3>Design goals</h3>
++ * <ul>
++ *   <li><b>Lightweight</b>: {@code viewDistance = 0} (no chunk loading), no
++ *       packet serialization, no keepAlive, no stats I/O.</li>
++ *   <li><b>Correct combat</b>: takes knockback via the normal
++ *       {@link EntityLiving#damageEntity} path; respects {@code noDamageTicks};
++ *       issues vanilla-strength melee attacks.</li>
++ *   <li><b>No side effects</b>: death does not fire {@code PlayerDeathEvent},
++ *       no loot is dropped, no respawn screen appears.</li>
++ * </ul>
++ *
++ * <h3>Tick architecture</h3>
++ * The world calls {@link #t_()} every tick.  Our override chains:
++ * <ol>
++ *   <li>{@code super.t_()} — light EntityPlayer tick (invulnerableTicks,
++ *       noDamageTicks, container check, spectator check).</li>
++ *   <li>{@code super.l()} — full physics via {@code EntityHuman.t_()}:
++ *       gravity, velocity, potion effects, food, AI hooks.  All
++ *       {@code sendPacket()} calls inside are no-ops.</li>
++ *   <li>{@link #tickAI()} — our custom state machine.</li>
++ * </ol>
++ * {@link #l()} is overridden to a no-op because it is only invoked by
++ * {@link PlayerConnection} movement-packet handlers that we suppress.
++ *
++ * <h3>Thread safety</h3>
++ * All operations must occur on the server main thread.
++ */
++public class EntityFakePlayer extends EntityPlayer {
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // AI state machine
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /** Operating mode for this fake player. */
++    public enum Mode {
++        /**
++         * Static NPC — does not move or attack.
++         * Takes damage and knockback normally.
++         */
++        NPC,
++        /**
++         * Static display entity — immune to all entity-sourced damage and
++         * knockback (sword hits, arrows, explosions, etc.).
++         * Environmental damage (fall, fire, void) is unaffected.
++         */
++        NO_AI,
++        /** Combat bot — pursues and attacks the current {@link #combatTarget}. */
++        COMBAT
++    }
++
++    private Mode mode = Mode.NPC;
++    private EntityLiving combatTarget = null;
++
++    /** Ticks remaining before the next attack is allowed (vanilla: 20 ticks). */
++    private int attackCooldown = 0;
++
++    /**
++     * Ticks remaining during which AI motion is suppressed to let knockback
++     * play out.  Set by {@link #damageEntity} the moment real damage is
++     * registered — before {@link Entity#g} (the actual knockback impulse) is
++     * called by the attacker.  This makes the guard independent of entity-tick
++     * ordering (FakePlayer may tick before or after its attacker).
++     */
++    private int knockbackCooldown = 0;
++
++    /**
++     * Number of golden apples available to this bot.
++     * Decremented each time one is fully consumed.  0 means no healing available.
++     */
++    private int gappleCount = 0;
++
++    /**
++     * Countdown for the current eating animation, in ticks.
++     * Counts from {@link #EAT_DURATION_TICKS} down to 0.  0 = not eating.
++     */
++    private int eatTicks = 0;
++    /**
++     * Ticks remaining before the bot may eat another golden apple.
++     * Set to {@link #GAPPLE_COOLDOWN_TICKS} when an eat completes.
++     */
++    private int gappleCooldown = 0;
++
++    /**
++     * Whether this bot is allowed to place water to extinguish itself.
++     * Defaults to {@code true}.  Set to {@code false} for bots where the
++     * water-clutch mechanic is undesired (arenas without water, etc.).
++     */
++    private boolean waterEnabled = true;
++
++    // ── Water clutch ─────────────────────────────────────────────────────────
++
++    /**
++     * Current phase of the bucket-hold countdown.
++     * <ul>
++     *   <li>0 — bucket hold done (water may or may not be active, see {@link #waterPos})</li>
++     *   <li>{@link #WATER_START_PHASE} → {@link #WATER_PLACE_PHASE}+1 — holding bucket</li>
++     *   <li>{@link #WATER_PLACE_PHASE} — place water this tick, then → 0</li>
++     * </ul>
++     */
++    private int           waterPhase       = 0;
++    /**
++     * Ticks the placed water block will stay on the ground.
++     * Decremented each tick while {@link #waterPos} is non-null.
++     * Set to 1 (fire) or {@link #waterLavaStayTicks} (lava) at placement time.
++     */
++    private int           waterActiveTicks = 0;
++    /** Ticks until the next water clutch is allowed. */
++    private int           waterCooldown    = 0;
++    /** World position where the water source was placed, used for removal. */
++    private BlockPosition waterPos         = null;
++    /** Hand item active before the bucket was swapped in; restored after clutch. */
++    private ItemStack     savedHand        = null;
++
++    /** Walk speed in blocks per tick (vanilla walk ≈ 0.18). */
++    private static final double WALK_SPEED = 0.20;
++    /**
++     * Sprint speed in blocks per tick.
++     * Vanilla sprint equilibrium ≈ 0.28 b/t (attribute 0.1 × 1.3 × friction chain).
++     */
++    private static final double SPRINT_SPEED = 0.28;
++    /**
++     * Horizontal speed while swimming.
++     * Fluid drag (factor 0.8/tick) caps effective speed to ~50 % of ground;
++     * 0.10 keeps movement responsive without fighting the physics.
++     */
++    private static final double SWIM_SPEED = 0.10;
++    /**
++     * Upward velocity applied every tick while submerged.
++     *
++     * <p>Fluid physics in {@link Entity#t_()} apply per tick:
++     * {@code motY = motY × 0.8 − 0.02}.  At 0.20, the net ascent after damping
++     * is {@code 0.20 × 0.8 − 0.02 = 0.14 b/t}, which reliably lifts the bot
++     * to the surface without overshooting.</p>
++     */
++    private static final double SWIM_UP_SPEED = 0.20;
++    /**
++     * Vanilla jump initial upward velocity.
++     * Produces a peak height of ~1.25 blocks on flat ground.
++     */
++    private static final double JUMP_VELOCITY = 0.42;
++    /**
++     * Melee attack range squared (3.5 blocks → 12.25 blocks²).
++     *
++     * <p>3.5 blocks is the standard reach used on competitive 1.8 servers to
++     * compensate for client-side latency and gives the bot a natural feel.
++     * Vanilla client reach is 3 blocks but the server-side check is typically
++     * set slightly higher.</p>
++     */
++    private static final double ATTACK_RANGE_SQ = 12.25; // 3.5 blocks
++    /**
++     * Phantom swing range squared (7 blocks → 49 blocks²).
++     *
++     * <p>Between {@link #ATTACK_RANGE_SQ} and this value the bot performs arm-swing
++     * animations at the normal rate ({@link #ATTACK_COOLDOWN_TICKS}) without
++     * dealing damage.  Mimics a real player clicking while closing distance.</p>
++     */
++    private static final double PHANTOM_RANGE_SQ = 49.0; // 7 blocks
++    /**
++     * Ticks between arm-swing and damage attempts (4 ticks = 5 CPS / 0.2 s).
++     *
++     * <p>Damage is no longer gated on the target's {@code noDamageTicks}: the
++     * call is always forwarded to {@link EntityHuman#attack}, which delegates
++     * to {@link EntityLiving#damageEntity}.  That method's own invincibility
++     * check ({@code noDamageTicks > maxNoDamageTicks / 2}) blocks redundant
++     * hits automatically, so on vanilla servers effective hits land every
++     * ~10–12 ticks (≈ 2 hits/s).  On competitive servers where
++     * {@code maxNoDamageTicks} is reduced to 0 every swing deals damage,
++     * yielding the intended 5 CPS.</p>
++     */
++    private static final int ATTACK_COOLDOWN_TICKS = 4;
++    /**
++     * Ticks to hold AI motion after taking damage.
++     * Vanilla knockback decays to walk-speed in ~6 ticks on normal ground
++     * (friction factor 0.546 per tick).
++     */
++    private static final int KNOCKBACK_PRESERVE_TICKS = 6;
++    /**
++     * Health points below which the bot will eat a golden apple (default 14 HP = 7 hearts).
++     * Chosen high enough that Regeneration II has time to heal before death.
++     */
++    private static final float EAT_HP_THRESHOLD   = 14.0f;
++    /**
++     * Ticks required to finish eating one golden apple.
++     * Vanilla food items take 32 ticks (1.6 s).
++     */
++    private static final int   EAT_DURATION_TICKS = 32;
++    /**
++     * Ticks the bot must wait between consecutive golden apple eats (1.5 s = 30 ticks).
++     * Prevents back-to-back consumption when health dips below the threshold multiple
++     * times in quick succession.
++     */
++    private static final int   GAPPLE_COOLDOWN_TICKS = 30;
++    /**
++     * Index of the "using item / blocking" flag in {@link Entity}'s DataWatcher byte 0.
++     * Bit 4 (0x10) — causes clients to render the eating/blocking arm-raise animation.
++     */
++    private static final int   FLAG_USING_ITEM    = 4;
++
++    /**
++     * Ticks to hold the water bucket in hand before placing (0.3 s = 6 ticks).
++     * The client animation is visible for exactly this duration.
++     */
++    private static final int WATER_HOLD_TICKS  = 6;
++    /**
++     * Starting value of {@link #waterPhase} (the bucket-hold countdown).
++     * One tick is reserved for the actual placement step.
++     */
++    private static final int WATER_START_PHASE = WATER_HOLD_TICKS + 1; // 7
++    /**
++     * Value of {@link #waterPhase} at which the water source block is placed.
++     * This is the last decrement step before the phase returns to 0.
++     */
++    private static final int WATER_PLACE_PHASE = 1;
++
++    /**
++     * Per-bot cooldown between water clutches, in ticks.
++     * Default 100 ticks (5 s).  Adjustable via {@link #setWaterCooldownDuration(int)}.
++     */
++    private int waterCooldownDuration = 100;
++    /**
++     * Ticks the water block stays active when the bot's feet or head are in lava.
++     * Default 60 ticks (3 s) — enough to survive full submersion and extinguish.
++     * Adjustable via {@link #setWaterLavaStayTicks(int)}.
++     */
++    private int waterLavaStayTicks = 60;
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Per-clone customisation — skin & reach
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Per-clone squared melee reach in blocks².
++     * Defaults to {@link #ATTACK_RANGE_SQ} (3.5 blocks).
++     * Changed via {@link #setAttackRange(double)}.
++     */
++    private double attackRangeSq = ATTACK_RANGE_SQ;
++
++    /**
++     * Base64-encoded textures JSON placed as the {@code "textures"} property
++     * in this bot's {@link GameProfile}.  {@code null} = no custom skin
++     * (clients fall back to the default Steve skin).
++     *
++     * <p>Build this value with {@link #setSkin(String, boolean, String)} or
++     * supply a pre-signed value from the Mojang API with
++     * {@link #setSkinRaw(String, String)}.</p>
++     */
++    private String skinTextureValue = null;
++
++    /**
++     * Mojang signature for {@link #skinTextureValue}, or {@code null} for an
++     * unsigned property.
++     *
++     * <p>Unsigned skins are accepted by most servers in offline/Bungeecord
++     * mode but may be refused by vanilla online-mode clients.</p>
++     */
++    private String skinSignature = null;
++
++    /**
++     * Whether the slim-arm (Alex) model is used when a custom skin is set.
++     * {@code false} = Steve (default 4-px arms), {@code true} = Alex (3-px).
++     * Has no effect when no custom skin is installed.
++     */
++    private boolean skinSlimModel = false;
++
++    /**
++     * Cape texture URL embedded in the textures JSON, or {@code null} for no
++     * cape.  Relevant only when {@link #skinTextureValue} is also set.
++     */
++    private String capeTextureUrl = null;
++
++    /**
++     * Horizontal impulse added per tick toward the target while the FakePlayer
++     * is airborne (W-tap simulation).
++     *
++     * <p>Vanilla air-control factor is 0.02 × sprint-speed ≈ 0.0056 b/t.  We use
++     * 20 % of {@link #SPRINT_SPEED} (= 0.056 b/t) — roughly 10× vanilla — so the
++     * FakePlayer visibly fights the arc without overriding it completely.  This
++     * reduces peak knockback drift from ~6 blocks to ~3–4 blocks, matching what a
++     * skilled player achieves with a W-tap.</p>
++     */
++    private static final double AIR_COUNTERFORCE = SPRINT_SPEED * 0.20;
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Construction
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Creates a new EntityFakePlayer with the given number of golden apples.
++     *
++     * <p>The entity is NOT yet added to the world.  Call
++     * {@link WorldServer#addEntity(Entity)} after setting the initial position
++     * via {@link #setPositionRotation(double, double, double, float, float)}.</p>
++     *
++     * @param server      the MinecraftServer instance
++     * @param world       the target world
++     * @param name        display name (must be ≤16 chars for vanilla client compatibility)
++     * @param gappleCount initial number of golden apples available for self-healing
++     */
++    public EntityFakePlayer(MinecraftServer server, WorldServer world, String name, int gappleCount) {
++        super(server, world,
++              new GameProfile(UUID.randomUUID(), name),
++              new PlayerInteractManager(world));
++
++        this.gappleCount = Math.max(0, gappleCount);
++
++        // Disable chunk loading — view distance 0 means PlayerChunkMap never
++        // enqueues chunks for this player.
++        this.viewDistance = 0;
++
++        // Wire up the no-op network stack.
++        FakeNetworkManager fakeNet = new FakeNetworkManager();
++        this.playerConnection = new FakePlayerConnection(server, fakeNet, this);
++
++        // Skip the one-tick joining delay used by real players.
++        this.joining = false;
++
++        // Start with full invulnerability window suppressed so combat can begin
++        // immediately.  Plugins can restore this if desired.
++        this.invulnerableTicks = 0;
++
++        // Keep food at maximum so EntityHuman.t_() never auto-cancels sprint.
++        // exhaustionLevel = 0 prevents saturation drain; saturation = 20 gives a
++        // long buffer before foodLevel would start dropping.
++        this.getFoodData().foodLevel      = 20;
++        this.getFoodData().saturationLevel = 20.0f;
++        this.getFoodData().exhaustionLevel = 0.0f;
++
++        // Replace the default inventory with a no-pickup variant.
++        // EntityItem.d(EntityHuman) calls inventory.canHold() first; returning 0
++        // short-circuits the entire pickup path (no event, no transfer, no fly-to
++        // animation).  The golden apple shown in-hand during eating is managed
++        // directly via setItem() and is NOT subject to this restriction.
++        this.inventory = new PlayerInventory(this) {
++            @Override public int     canHold(ItemStack itemstack) { return 0;     }
++            @Override public boolean pickup (ItemStack itemstack)  { return false; }
++        };
++    }
++
++    /**
++     * Convenience constructor — creates a FakePlayer with no golden apples.
++     *
++     * @param server the MinecraftServer instance
++     * @param world  the target world
++     * @param name   display name (must be ≤16 chars for vanilla client compatibility)
++     */
++    public EntityFakePlayer(MinecraftServer server, WorldServer world, String name) {
++        this(server, world, name, 0);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Entity tick
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Main entity tick, called every game tick by {@link World#entityJoinedWorld}.
++     *
++     * <p>Executes three phases in order: the light EntityPlayer tick, the full
++     * EntityHuman physics tick, then our AI.</p>
++     */
++    @Override
++    public void t_() {
++        if (this.dead) return;
++
++        // Phase 1 — light EntityPlayer tick.
++        // Handles invulnerableTicks, noDamageTicks, container check, chunk queue
++        // (empty for viewDistance=0), removeQueue (empty since sendPacket is
++        // no-op so packets are dropped before being queued here).
++        super.t_();
++
++        // Phase 2 — full entity physics.
++        // super.l() calls EntityPlayer.l() → super.t_() = EntityHuman.t_()
++        // → EntityLiving.t_() → Entity.t_() for gravity, velocity, effects.
++        // Every sendPacket() inside is silently dropped by FakePlayerConnection.
++        super.l();
++
++        // Phase 3 — custom AI.
++        tickAI();
++    }
++
++    /**
++     * Overridden to a no-op.
++     *
++     * <p>{@code l()} is normally invoked by {@link PlayerConnection} position/
++     * flying packet handlers.  Since our {@link FakePlayerConnection} suppresses
++     * all incoming packets, this would never be called anyway.  Physics are
++     * driven instead through {@link #t_()} → {@code super.l()}.</p>
++     */
++    @Override
++    public void l() {
++        // No-op: physics are handled via super.l() in t_().
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // AI implementation
++    // ─────────────────────────────────────────────────────────────────────────
++
++    private void tickAI() {
++        // NO_AI: fully static, no AI of any kind (water clutch also skipped).
++        if (mode == Mode.NO_AI) return;
++        if (mode != Mode.COMBAT || combatTarget == null) return;
++
++        // Drop target if it died.
++        if (combatTarget.dead || !combatTarget.isAlive()) {
++            combatTarget = null;
++            return;
++        }
++
++        // ── Water cooldown (always ticked, independent of state) ──────────────
++        if (waterCooldown > 0) --waterCooldown;
++
++        // ── Water clutch — highest priority (fire is immediately dangerous) ───
++        // Drive any active sequence: bucket-hold phase OR active water block.
++        if (waterPhase > 0 || waterPos != null) {
++            tickWater();
++            return;
++        }
++        // Start a clutch when on fire, cooldown elapsed, and ground allows it.
++        if (waterEnabled && this.fireTicks > 0 && waterCooldown == 0 && canPlaceWater()) {
++            if (eatTicks > 0) cancelEating(); // interrupt eating — fire is urgent
++            startWaterClutch();
++            return;
++        }
++
++        // ── Eating phase — takes priority over combat ──────────────────────────
++        if (gappleCooldown > 0) --gappleCooldown;
++
++        if (eatTicks > 0) {
++            tickEating();
++            return;
++        }
++        if (gappleCount > 0 && gappleCooldown == 0 && this.getHealth() < EAT_HP_THRESHOLD) {
++            // FakePlayerEatEvent — cancellable; no apple consumed if cancelled.
++            if (!this.world.isClientSide) {
++                org.bukkit.event.fakeplayer.FakePlayerEatEvent evt =
++                        new org.bukkit.event.fakeplayer.FakePlayerEatEvent(
++                                (org.bukkit.entity.Player) this.getBukkitEntity(),
++                                gappleCount - 1);
++                org.bukkit.Bukkit.getPluginManager().callEvent(evt);
++                if (evt.isCancelled()) return;
++            }
++            startEating();
++            return;
++        }
++
++        // ── Normal combat ─────────────────────────────────────────────────────
++        faceTarget();
++        moveTowardTarget();
++
++        if (attackCooldown > 0) {
++            --attackCooldown;
++        } else {
++            tryAttack();
++        }
++    }
++
++    /** Rotates yaw/pitch to face the current combat target. */
++    private void faceTarget() {
++        double dx = combatTarget.locX - this.locX;
++        double dy = (combatTarget.locY + combatTarget.length / 2.0)
++                    - (this.locY + this.getHeadHeight());
++        double dz = combatTarget.locZ - this.locZ;
++        double horizDist = Math.sqrt(dx * dx + dz * dz);
++
++        this.yaw = (float) (Math.atan2(-dx, dz) * (180.0 / Math.PI));
++        this.pitch = (float) -(Math.atan2(dy, horizDist) * (180.0 / Math.PI));
++    }
++
++    /**
++     * Applies motion toward the target each tick, handling three distinct movement
++     * modes: fluid swimming, airborne counterforce, and ground sprinting with
++     * automatic obstacle jumping.
++     *
++     * <h4>Knockback preservation — two complementary guards</h4>
++     * <ol>
++     *   <li><b>{@code velocityChanged}</b> — set by {@link Entity#g} in the same
++     *       game tick the hit lands (cleared by the entity tracker at tick end).
++     *       Guards against overwriting the impulse within the same tick.</li>
++     *   <li><b>{@link #knockbackCooldown}</b> — set in {@link #damageEntity} the
++     *       instant real damage is registered, <em>before</em> {@link Entity#g} is
++     *       called by the attacker.  Preserves residual velocity over subsequent
++     *       ticks regardless of tick ordering.</li>
++     * </ol>
++     *
++     * <h4>Fluid swimming</h4>
++     * When {@link #isInFluid()} is true, reduced horizontal speed is applied and
++     * a constant upward impulse ({@link #SWIM_UP_SPEED}) counteracts the fluid's
++     * downward pull so the bot rises naturally to the surface.
++     *
++     * <h4>Air counterforce (W-tap simulation)</h4>
++     * While airborne outside the knockback window, a small impulse
++     * ({@link #AIR_COUNTERFORCE}) is added toward the target each tick, reducing
++     * knockback drift from ~6 blocks to ~3–4 blocks.
++     *
++     * <h4>Obstacle jumping</h4>
++     * When on the ground and moving, {@link Entity#positionChanged} (set by
++     * {@link Entity#move} in the preceding physics step when the horizontal
++     * displacement was clipped by a solid block) signals that the entity hit a
++     * wall.  We respond with a vanilla jump impulse ({@link #JUMP_VELOCITY})
++     * to step over 1-block-high obstacles.
++     */
++    private void moveTowardTarget() {
++        // ── Knockback guard ────────────────────────────────────────────────────
++        if (this.velocityChanged || this.knockbackCooldown > 0) {
++            if (this.knockbackCooldown > 0) --this.knockbackCooldown;
++            return;
++        }
++
++        double dx          = combatTarget.locX - this.locX;
++        double dz          = combatTarget.locZ - this.locZ;
++        double horizDistSq = dx * dx + dz * dz;
++        boolean outOfRange = horizDistSq > attackRangeSq;
++
++        // ── Fluid movement (water / lava) ──────────────────────────────────────
++        // Apply reduced horizontal speed (fluid drag ≈ 0.8/tick) and a steady
++        // upward impulse so the bot swims toward the surface automatically.
++        // Sprint flag is cleared because it has no effect while submerged and
++        // would incorrectly drain food.
++        if (isInFluid()) {
++            this.setSprinting(false);
++            if (outOfRange && horizDistSq > 1e-4) {
++                double d = Math.sqrt(horizDistSq);
++                this.motX = (dx / d) * SWIM_SPEED;
++                this.motZ = (dz / d) * SWIM_SPEED;
++            } else {
++                this.motX = 0.0;
++                this.motZ = 0.0;
++            }
++            // Swim upward regardless of horizontal position — the fluid tick
++            // will dampen this to ~0.14 b/t net ascent per step.
++            this.motY = SWIM_UP_SPEED;
++            return;
++        }
++
++        // ── Air counterforce ───────────────────────────────────────────────────
++        // Vanilla air-control factor is ~0.02.  We add a small bias toward the
++        // target so the FakePlayer partially fights the knockback arc, as a
++        // skilled player presses W during airborne knockback.
++        if (!this.onGround) {
++            if (outOfRange && horizDistSq > 1e-4) {
++                double d = Math.sqrt(horizDistSq);
++                this.motX += (dx / d) * AIR_COUNTERFORCE;
++                this.motZ += (dz / d) * AIR_COUNTERFORCE;
++            }
++            return;
++        }
++
++        // ── Ground movement ────────────────────────────────────────────────────
++        // Keep sprinting through the attack range — only stop at physical
++        // collision distance (~1 block²) to avoid clipping into the target.
++        // Stopping at ATTACK_RANGE_SQ was causing the bot to halt mid-fight,
++        // making it miss hits when the target stepped back.
++        if (horizDistSq > 1.0) {
++            double d = Math.sqrt(horizDistSq);
++            this.setSprinting(true);
++            this.motX = (dx / d) * SPRINT_SPEED;
++            this.motZ = (dz / d) * SPRINT_SPEED;
++            // Obstacle jump: Entity.move() sets positionChanged when the
++            // entity's horizontal displacement was clipped by a solid block
++            // during the last physics step.  Jump to clear 1-block-high walls;
++            // motY guard prevents re-triggering while already ascending.
++            if (this.positionChanged && this.motY <= 0.0) {
++                this.motY = JUMP_VELOCITY;
++            }
++        } else {
++            this.setSprinting(false);
++            this.motX = 0.0;
++            this.motZ = 0.0;
++        }
++    }
++
++    /**
++     * Returns {@code true} if the entity's mid-body (at {@code locY + 0.5}) is
++     * inside a liquid block (water or lava).
++     *
++     * <p>The {@code + 0.5} offset avoids false positives when only the tip of
++     * a foot grazes the surface of a fluid source block.  It also correctly
++     * detects submersion at any depth because a 1-block fluid column covers the
++     * whole range {@code [Y, Y+1)}, and {@code locY + 0.5} always falls inside
++     * that range once the entity has sunk at least half a block.</p>
++     */
++    private boolean isInFluid() {
++        return this.world
++                   .getType(new BlockPosition(this.locX, this.locY + 0.5, this.locZ))
++                   .getBlock()
++                   .getMaterial()
++                   .isLiquid();
++    }
++
++    /**
++     * Handles attack logic based on distance to the target:
++     * <ul>
++     *   <li><b>≤ {@link #ATTACK_RANGE_SQ}</b> — real attack: arm swing + damage.</li>
++     *   <li><b>≤ {@link #PHANTOM_RANGE_SQ}</b> — phantom swing: arm animation only,
++     *       no damage.  Simulates a real player clicking while closing the gap.</li>
++     *   <li><b>beyond phantom range</b> — no action; cooldown is not consumed so
++     *       the bot attacks immediately once it closes in.</li>
++     * </ul>
++     *
++     * <p>{@code bw()} is {@link EntityLiving}'s swing-arm method: it guards against
++     * double-triggering, sets {@code ar=true}/{@code as=-1}, then sends
++     * {@link PacketPlayOutAnimation} (type 0) to all tracking players via the
++     * entity tracker.</p>
++     */
++    /**
++     * Handles attack logic based on distance to the target.
++     *
++     * <h4>Damage delegation</h4>
++     * Every swing in melee range forwards directly to {@link EntityHuman#attack}.
++     * {@link EntityLiving#damageEntity} contains its own invincibility check
++     * ({@code noDamageTicks > maxNoDamageTicks / 2}) that silently rejects
++     * redundant hits — we do not replicate that logic here.  This means:
++     * <ul>
++     *   <li>On servers with {@code maxNoDamageTicks = 0} (no hit-delay): every
++     *       swing deals damage (5 CPS at {@link #ATTACK_COOLDOWN_TICKS} = 4).</li>
++     *   <li>On vanilla servers ({@code maxNoDamageTicks = 20}): effective hits
++     *       land every ~10–12 ticks (≈ 2 hits/s), matching a fast-clicking
++     *       human player.</li>
++     * </ul>
++     *
++     * <h4>Zones</h4>
++     * <ul>
++     *   <li><b>≤ {@link #ATTACK_RANGE_SQ}</b> — swing + damage attempt
++     *       (fires {@link FakePlayerAttackEvent}).</li>
++     *   <li><b>≤ {@link #PHANTOM_RANGE_SQ}</b> — swing only, no event.</li>
++     *   <li><b>beyond phantom range</b> — nothing; cooldown not consumed.</li>
++     * </ul>
++     */
++    private void tryAttack() {
++        double dx     = combatTarget.locX - this.locX;
++        double dy     = combatTarget.locY - this.locY;
++        double dz     = combatTarget.locZ - this.locZ;
++        double distSq = dx * dx + dy * dy + dz * dz;
++
++        if (distSq <= attackRangeSq) {
++            this.bw();
++            attackCooldown = ATTACK_COOLDOWN_TICKS;
++
++            // Always attempt damage — EntityLiving.damageEntity() rejects the
++            // call internally when the target is still in its invincibility
++            // window, so no explicit noDamageTicks check is needed here.
++            if (!this.world.isClientSide) {
++                org.bukkit.entity.LivingEntity bTarget =
++                        (org.bukkit.entity.LivingEntity) combatTarget.getBukkitEntity();
++                org.bukkit.event.fakeplayer.FakePlayerAttackEvent evt =
++                        new org.bukkit.event.fakeplayer.FakePlayerAttackEvent(
++                                (org.bukkit.entity.Player) this.getBukkitEntity(), bTarget);
++                org.bukkit.Bukkit.getPluginManager().callEvent(evt);
++                if (evt.isCancelled()) return;
++            }
++
++            boolean wasAlive = !combatTarget.dead;
++            this.attack(combatTarget);
++
++            // Kill detection.
++            if (!this.world.isClientSide && wasAlive
++                    && (combatTarget.dead || !combatTarget.isAlive())) {
++                org.bukkit.entity.LivingEntity bVictim =
++                        (org.bukkit.entity.LivingEntity) combatTarget.getBukkitEntity();
++                org.bukkit.Bukkit.getPluginManager().callEvent(
++                        new org.bukkit.event.fakeplayer.FakePlayerKillEvent(
++                                (org.bukkit.entity.Player) this.getBukkitEntity(), bVictim));
++            }
++
++        } else if (distSq <= PHANTOM_RANGE_SQ) {
++            // Phantom swing — animation only, no event, no damage attempt.
++            this.bw();
++            attackCooldown = ATTACK_COOLDOWN_TICKS;
++        }
++        // Beyond phantom range: cooldown stays at 0 so the bot attacks immediately
++        // the instant the target enters melee distance.
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Water clutch — fire extinguish
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Returns {@code true} when the bot can safely place a water source at its
++     * feet.
++     *
++     * <p>Two conditions are required:
++     * <ol>
++     *   <li>The bot is on the ground ({@link Entity#onGround}).</li>
++     *   <li>The block directly below the feet is not air (user requirement: a
++     *       solid surface must exist to "click on" with the bucket).</li>
++     * </ol>
++     * The block AT feet level must also be replaceable (air or similar) so the
++     * water source can actually be placed there.</p>
++     */
++    private boolean canPlaceWater() {
++        if (!this.onGround) return false;
++        int fx = MathHelper.floor(this.locX);
++        int fy = MathHelper.floor(this.locY);
++        int fz = MathHelper.floor(this.locZ);
++        // Block below (what the bot stands on) must not be air.
++        Material belowMat = this.world.getType(new BlockPosition(fx, fy - 1, fz))
++                                      .getBlock().getMaterial();
++        if (belowMat == Material.AIR) return false;
++        // Block at feet must accept water placement (replaceable = air, water, etc.)
++        Material footMat = this.world.getType(new BlockPosition(fx, fy, fz))
++                                     .getBlock().getMaterial();
++        return footMat.isReplaceable();
++    }
++
++    /**
++     * Begins the water-clutch sequence.
++     *
++     * <p>Sets {@link #waterPhase} to {@link #WATER_START_PHASE} and swaps the
++     * hand item to a water bucket so clients see the correct item during the hold
++     * animation.  The previous hand item is saved in {@link #savedHand} for
++     * restoration at sequence end.</p>
++     */
++    private void startWaterClutch() {
++        waterPhase = WATER_START_PHASE;
++        savedHand  = this.inventory.getItemInHand();
++        this.inventory.setItem(this.inventory.itemInHandIndex,
++                               new ItemStack(Items.WATER_BUCKET));
++    }
++
++    /**
++     * Drives the water-clutch sequence each tick.  Handles two sub-phases:
++     *
++     * <h4>Active-water sub-phase ({@link #waterPos} ≠ null)</h4>
++     * The source block is on the ground; {@link #waterActiveTicks} counts down.
++     * When it reaches 0 the block is removed (restored to air), the hand item
++     * is restored, and the per-bot cooldown ({@link #waterCooldownDuration}) is armed.
++     *
++     * <h4>Bucket-hold sub-phase ({@link #waterPhase} > 0)</h4>
++     * {@link #waterPhase} decrements each tick.  When it reaches
++     * {@link #WATER_PLACE_PHASE} the water source block is placed and
++     * {@link #waterActiveTicks} is set to:
++     * <ul>
++     *   <li><b>1 tick</b> — normal fire (removed next physics step, enough to extinguish)</li>
++     *   <li><b>{@link #waterLavaStayTicks}</b> — lava detected at feet or head
++     *       (bot needs several seconds of water contact to leave the lava pool)</li>
++     * </ul>
++     * Direct NMS block placement: {@code BlockPlaceEvent} / {@code BlockBreakEvent}
++     * are NOT fired by this code.
++     */
++    private void tickWater() {
++        // ── Active-water sub-phase ─────────────────────────────────────────────
++        if (waterPos != null) {
++            if (--waterActiveTicks <= 0) {
++                this.world.setTypeAndData(waterPos, Blocks.AIR.getBlockData(), 3);
++                waterPos = null;
++                this.inventory.setItem(this.inventory.itemInHandIndex, savedHand);
++                savedHand     = null;
++                waterCooldown = waterCooldownDuration;
++            }
++            return; // waterPhase is 0 here; always return
++        }
++
++        // ── Bucket-hold / placement sub-phase ─────────────────────────────────
++        if (waterPhase == WATER_PLACE_PHASE) {
++            waterPos = new BlockPosition(this.locX, this.locY, this.locZ);
++            this.world.setTypeAndData(waterPos, Blocks.WATER.getBlockData(), 3);
++            // Stay longer if in lava so the bot can fully exit the pool.
++            waterActiveTicks = isInLava() ? waterLavaStayTicks : 1;
++        }
++        --waterPhase;
++    }
++
++    /**
++     * Aborts an in-progress water clutch, cleaning up the placed water block
++     * (if any) and restoring the previous hand item.  Used when the bot dies,
++     * switches to a static mode, or {@link #setWaterEnabled(boolean)} is called
++     * with {@code false} mid-sequence.
++     */
++    private void cancelWater() {
++        if (waterPos != null) {
++            this.world.setTypeAndData(waterPos, Blocks.AIR.getBlockData(), 3);
++            waterPos = null;
++        }
++        this.inventory.setItem(this.inventory.itemInHandIndex, savedHand);
++        savedHand        = null;
++        waterPhase       = 0;
++        waterActiveTicks = 0;
++    }
++
++    /**
++     * Returns {@code true} if the bot's feet block or head block is lava
++     * (either flowing or stationary).
++     *
++     * <p>Checks two positions:
++     * <ul>
++     *   <li><b>Feet</b>: block at {@code (floor(locX), floor(locY), floor(locZ))}</li>
++     *   <li><b>Head</b>: block at {@code (floor(locX), floor(locY + 1.4), floor(locZ))}</li>
++     * </ul>
++     * Both flowing ({@code Blocks.FLOWING_LAVA}) and stationary
++     * ({@code Blocks.LAVA}) lava share {@link Material#LAVA}, so a single
++     * {@code getMaterial()} comparison covers both.</p>
++     */
++    private boolean isInLava() {
++        int fx = MathHelper.floor(this.locX);
++        int fz = MathHelper.floor(this.locZ);
++        Material feetMat = this.world
++                .getType(new BlockPosition(fx, MathHelper.floor(this.locY), fz))
++                .getBlock().getMaterial();
++        Material headMat = this.world
++                .getType(new BlockPosition(fx, MathHelper.floor(this.locY + 1.4), fz))
++                .getBlock().getMaterial();
++        return feetMat == Material.LAVA || headMat == Material.LAVA;
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Eating — golden apple consumption
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Begins eating a golden apple.
++     *
++     * <ul>
++     *   <li>Halts movement and sprinting, <em>unless</em> an active knockback
++     *       window is detected ({@link #knockbackCooldown} &gt; 0): in that case
++     *       the velocity is preserved so the impulse plays out normally.  The
++     *       subsequent {@link #tickEating()} calls carry the same guard for the
++     *       remainder of the eating animation.</li>
++     *   <li>Sets the {@link #FLAG_USING_ITEM} flag in the DataWatcher so clients
++     *       render the "arm raised" eating animation.</li>
++     *   <li>Places a {@link Items#GOLDEN_APPLE} in the held slot so clients
++     *       show the correct item during the eating pose.</li>
++     * </ul>
++     */
++    private void startEating() {
++        eatTicks = EAT_DURATION_TICKS;
++        this.setSprinting(false);
++        // If a knockback impulse was just applied (damageEntity set knockbackCooldown
++        // before calling Entity.g() on the attacker side), preserve the velocity so
++        // the knockback plays out.  tickEating() carries the same guard for the
++        // remaining ticks of the animation.
++        if (this.knockbackCooldown == 0) {
++            this.motX = 0.0;
++            this.motZ = 0.0;
++        }
++        // Arm-raise / eating animation visible to spectating players.
++        this.b(FLAG_USING_ITEM, true);
++        // Place apple in hand so clients render the food item during the pose.
++        this.inventory.setItem(this.inventory.itemInHandIndex,
++                               new ItemStack(Items.GOLDEN_APPLE));
++    }
++
++    /**
++     * Called each tick while the bot is eating.
++     *
++     * <p>Keeps the bot stationary and facing the target, but respects any
++     * active knockback window so received knockback plays out normally.
++     * Calls {@link #finishEating()} when the countdown reaches zero.</p>
++     */
++    private void tickEating() {
++        faceTarget();
++        this.setSprinting(false);
++
++        // Only zero velocity when no knockback is active — mirrors the guard
++        // in moveTowardTarget() so eating doesn't silently absorb knockback.
++        if (this.velocityChanged || this.knockbackCooldown > 0) {
++            if (this.knockbackCooldown > 0) --this.knockbackCooldown;
++        } else {
++            this.motX = 0.0;
++            this.motZ = 0.0;
++        }
++
++        if (--eatTicks <= 0) {
++            finishEating();
++        }
++    }
++
++    /**
++     * Completes the eating animation and applies vanilla golden-apple effects:
++     * <ul>
++     *   <li>Regeneration II for 5 seconds (100 ticks)</li>
++     *   <li>Absorption I for 2 minutes (2 400 ticks)</li>
++     *   <li>Food level / saturation restored (4 hunger + 9.6 saturation)</li>
++     * </ul>
++     * The golden apple is removed from the hand slot and the DataWatcher
++     * eating flag is cleared.
++     */
++    private void finishEating() {
++        --gappleCount;
++        gappleCooldown = GAPPLE_COOLDOWN_TICKS;
++        // Clear animation state.
++        this.b(FLAG_USING_ITEM, false);
++        this.inventory.setItem(this.inventory.itemInHandIndex, null);
++        // Potion effects — vanilla golden apple (1.8):
++        //   Regeneration II  (amplifier 1) for 100 ticks  (5 s)
++        //   Absorption I     (amplifier 0) for 2400 ticks (2 min)
++        this.addEffect(new MobEffect(MobEffectList.REGENERATION.id, 100,  1, false, true));
++        this.addEffect(new MobEffect(MobEffectList.ABSORBTION.id,   2400, 0, false, true));
++        // Restore food stats as if the item was eaten normally.
++        FoodMetaData food = this.getFoodData();
++        food.foodLevel      = Math.min(20, food.foodLevel + 4);
++        food.saturationLevel = Math.min(20.0f, food.saturationLevel + 9.6f);
++    }
++
++    /**
++     * Cancels an in-progress eating sequence without consuming a golden apple
++     * or applying any effects.  Used when the bot switches to NPC mode or dies.
++     */
++    private void cancelEating() {
++        eatTicks = 0;
++        this.b(FLAG_USING_ITEM, false);
++        this.inventory.setItem(this.inventory.itemInHandIndex, null);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Damage — knockback cooldown
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Intercepts successful damage to arm the knockback-preservation cooldown.
++     *
++     * <p>In {@link EntityHuman#attack}, the call order is:
++     * <ol>
++     *   <li>{@code target.damageEntity(…)} — damage applied, returns {@code true}</li>
++     *   <li>{@link Entity#g(double, double)} — knockback impulse applied on target</li>
++     * </ol>
++     * By setting {@link #knockbackCooldown} here — between steps 1 and 2 — we
++     * guarantee that {@link #moveTowardTarget()} will not override the impulse
++     * for the next {@link #KNOCKBACK_PRESERVE_TICKS} ticks, regardless of whether
++     * the FakePlayer ticks before or after its attacker in the same game tick.</p>
++     */
++    @Override
++    public boolean damageEntity(DamageSource damageSource, float damage) {
++        // NO_AI: immune to all entity-sourced damage (melee, arrows, explosions, ...).
++        // Environmental sources (fall, fire, void — getEntity() == null) pass through.
++        if (mode == Mode.NO_AI && damageSource.getEntity() != null) {
++            return false;
++        }
++
++        // FakePlayerDamagedEvent — fires before the damage pipeline.
++        // Cancelling skips all damage and prevents knockback.
++        if (!this.world.isClientSide) {
++            org.bukkit.entity.Entity bAttacker = (damageSource.getEntity() != null)
++                    ? damageSource.getEntity().getBukkitEntity()
++                    : null;
++            org.bukkit.event.fakeplayer.FakePlayerDamagedEvent evt =
++                    new org.bukkit.event.fakeplayer.FakePlayerDamagedEvent(
++                            (org.bukkit.entity.Player) this.getBukkitEntity(),
++                            damage, bAttacker);
++            org.bukkit.Bukkit.getPluginManager().callEvent(evt);
++            if (evt.isCancelled()) return false;
++            damage = evt.getDamage();
++        }
++
++        boolean tookDamage = super.damageEntity(damageSource, damage);
++        if (tookDamage) {
++            this.knockbackCooldown = KNOCKBACK_PRESERVE_TICKS;
++        }
++        return tookDamage;
++    }
++
++    /**
++     * Overrides the 3-argument knockback impulse to be a no-op in
++     * {@link Mode#NO_AI}.
++     *
++     * <p>This covers knockback from explosions, projectiles, and any other
++     * source that calls {@link Entity#g(double, double, double)} directly
++     * without going through {@link #damageEntity}.</p>
++     */
++    @Override
++    public void g(double d0, double d1, double d2) {
++        if (mode != Mode.NO_AI) {
++            super.g(d0, d1, d2);
++        }
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Death — no events, no loot
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Marks the entity dead and removes it from {@code world.players}.
++     *
++     * <p>We bypass {@link EntityPlayer#die(DamageSource)} to avoid firing
++     * {@code PlayerDeathEvent}, broadcasting a death message, or triggering
++     * the respawn screen.  No items are dropped.</p>
++     *
++     * <p>The entity tracker will receive the removal signal from the world's
++     * entity tick loop, which calls {@link World#b(Entity)} (→
++     * {@code tracker.untrackEntity()}) once {@code dead == true} is detected.</p>
++     */
++    @Override
++    public void die(DamageSource damageSource) {
++        if (this.dead) return;
++
++        // FakePlayerDeathEvent — cancellable; plugins can revive the bot here.
++        if (!this.world.isClientSide) {
++            org.bukkit.entity.Entity bKiller = (damageSource.getEntity() != null)
++                    ? damageSource.getEntity().getBukkitEntity()
++                    : null;
++            org.bukkit.event.fakeplayer.FakePlayerDeathEvent evt =
++                    new org.bukkit.event.fakeplayer.FakePlayerDeathEvent(
++                            (org.bukkit.entity.Player) this.getBukkitEntity(), bKiller);
++            org.bukkit.Bukkit.getPluginManager().callEvent(evt);
++            if (evt.isCancelled()) return;
++        }
++
++        // Cancel any in-progress sequences so the DataWatcher flag, hand item,
++        // and placed water block are all cleaned up before entity removal.
++        if (waterPhase > 0) cancelWater();
++        if (eatTicks  > 0) cancelEating();
++        // Broadcast the death-fall animation (EntityStatus 3) BEFORE marking dead.
++        // After dead=true the world tick will call untrackEntity() next tick, so
++        // the entity is still fully tracked here and clients will receive the packet.
++        if (this.world instanceof WorldServer) {
++            ((WorldServer) this.world).broadcastEntityEffect(this, (byte) 3);
++        }
++        // Mark dead without any of the EntityPlayer.die() side-effects.
++        // aP is EntityLiving's internal death flag (set at EntityLiving.die() line 874).
++        // Some animation/packet paths check aP rather than dead, so set it here too.
++        this.aP = true;
++        this.dead = true;
++        // Remove from world.players immediately so mob spawn logic and
++        // findNearbyPlayer() don't reference a dead entity.
++        this.world.players.remove(this);
++        this.world.everyoneSleeping();
++    }
++
++    /**
++     * No-parameter die (called by {@link World#kill} and internal paths).
++     * Delegates to {@link #die(DamageSource)} with a generic cause.
++     */
++    @Override
++    public void die() {
++        die(DamageSource.GENERIC);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Stats — no-op for performance
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Intercepts all potion-effect additions to fire {@link FakePlayerEffectEvent}.
++     * Cancelling the event prevents the effect from being applied.
++     */
++    @Override
++    public void addEffect(MobEffect mobeffect) {
++        if (!this.world.isClientSide) {
++            org.bukkit.potion.PotionEffectType pet =
++                    org.bukkit.potion.PotionEffectType.getById(mobeffect.getEffectId());
++            if (pet != null) {
++                org.bukkit.potion.PotionEffect bEffect = new org.bukkit.potion.PotionEffect(
++                        pet, mobeffect.getDuration(), mobeffect.getAmplifier(),
++                        mobeffect.isAmbient(), true);
++                org.bukkit.event.fakeplayer.FakePlayerEffectEvent evt =
++                        new org.bukkit.event.fakeplayer.FakePlayerEffectEvent(
++                                (org.bukkit.entity.Player) this.getBukkitEntity(), bEffect);
++                org.bukkit.Bukkit.getPluginManager().callEvent(evt);
++                if (evt.isCancelled()) return;
++            }
++        }
++        super.addEffect(mobeffect);
++    }
++
++    /** No-op: fake players don't record statistics. */
++    @Override
++    public void a(Statistic statistic, int i) { /* no-op */ }
++
++    /** No-op: fake players don't reset statistics. */
++    @Override
++    public void a(Statistic statistic) { /* no-op */ }
++
++    /** No-op: skip the biome-exploration achievement check every second. */
++    @Override
++    protected void i_() { /* no-op */ }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Skin helpers (private)
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Replaces the {@code "textures"} property in this bot's {@link GameProfile}
++     * with the current {@link #skinTextureValue} / {@link #skinSignature} pair.
++     * When {@code skinTextureValue} is {@code null} the property is removed,
++     * restoring the default appearance.
++     *
++     * <p>Call this after updating any skin field, then {@link #refreshTracking()}
++     * to propagate the change to already-connected observers.</p>
++     */
++    private void applySkinToProfile() {
++        GameProfile profile = this.getProfile();
++        profile.getProperties().removeAll("textures");
++        if (skinTextureValue != null) {
++            Property prop = (skinSignature != null)
++                    ? new Property("textures", skinTextureValue, skinSignature)
++                    : new Property("textures", skinTextureValue);
++            profile.getProperties().put("textures", prop);
++        }
++    }
++
++    /**
++     * Forces the entity tracker to re-send the spawn packet for this bot to all
++     * currently tracking players, so they immediately see any profile changes
++     * (skin, name, etc.).
++     *
++     * <p>This triggers a brief visual flicker (destroy + respawn) for observers.
++     * It is a no-op when the bot is dead or has not yet been added to the world.</p>
++     */
++    private void refreshTracking() {
++        if (!(this.world instanceof WorldServer) || this.dead) return;
++        EntityTracker tracker = ((WorldServer) this.world).tracker;
++        tracker.untrackEntity(this);
++        tracker.track(this);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Public API (used by FakePlayerManager)
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /** Returns the current operating mode. */
++    public Mode getFakeMode() {
++        return mode;
++    }
++
++    /**
++     * Sets the operating mode.
++     * Switching to {@link Mode#NPC} clears the target and stops movement.
++     */
++    public void setFakeMode(Mode mode) {
++        this.mode = mode;
++        if (mode == Mode.NPC || mode == Mode.NO_AI) {
++            this.combatTarget = null;
++            this.motX = 0.0;
++            this.motZ = 0.0;
++            this.setSprinting(false);
++            if (waterPhase > 0) cancelWater();
++            if (eatTicks   > 0) cancelEating();
++        }
++    }
++
++    /** Returns the current combat target, or {@code null} if none. */
++    public EntityLiving getCombatTarget() {
++        return combatTarget;
++    }
++
++    /**
++     * Sets the combat target.  Automatically switches to {@link Mode#COMBAT}
++     * if {@code target} is non-null.
++     */
++    public void setCombatTarget(EntityLiving target) {
++        this.combatTarget = target;
++        if (target != null) {
++            this.mode = Mode.COMBAT;
++            this.attackCooldown = 0;
++        }
++    }
++
++    /** Returns the number of golden apples remaining. */
++    public int getGappleCount() {
++        return gappleCount;
++    }
++
++    /**
++     * Sets the number of golden apples available.
++     *
++     * @param count non-negative apple count
++     */
++    public void setGappleCount(int count) {
++        this.gappleCount = Math.max(0, count);
++    }
++
++    /**
++     * Returns {@code true} while the bot is in the middle of eating a golden
++     * apple (i.e. during the {@link #EAT_DURATION_TICKS}-tick eating animation).
++     */
++    public boolean isEating() {
++        return eatTicks > 0;
++    }
++
++    /**
++     * Returns {@code true} while a water-clutch sequence is in progress
++     * (bucket hold + place + remove).
++     */
++    public boolean isPlacingWater() {
++        return waterPhase > 0;
++    }
++
++    /**
++     * Returns the ticks remaining before the next water clutch is allowed.
++     * 0 means the bot can clutch immediately (subject to fire and ground checks).
++     */
++    public int getWaterCooldown() {
++        return waterCooldown;
++    }
++
++    /**
++     * Force-resets the water-clutch cooldown so the bot can extinguish itself
++     * on the next fire tick without waiting.
++     */
++    public void resetWaterCooldown() {
++        this.waterCooldown = 0;
++    }
++
++    /** Returns {@code true} if this bot is allowed to use water to extinguish itself. */
++    public boolean isWaterEnabled() {
++        return waterEnabled;
++    }
++
++    /**
++     * Enables or disables the water-clutch self-extinguish mechanic.
++     *
++     * @param enabled {@code false} to prevent the bot from ever placing water
++     */
++    public void setWaterEnabled(boolean enabled) {
++        this.waterEnabled = enabled;
++        if (!enabled && (waterPhase > 0 || waterPos != null)) cancelWater();
++    }
++
++    /**
++     * Returns the per-bot cooldown between water clutches in ticks.
++     * Default: 100 ticks (5 s).
++     */
++    public int getWaterCooldownDuration() {
++        return waterCooldownDuration;
++    }
++
++    /**
++     * Sets the cooldown between water clutches for this bot specifically.
++     *
++     * @param ticks non-negative tick count; 0 means no cooldown between clutches
++     */
++    public void setWaterCooldownDuration(int ticks) {
++        this.waterCooldownDuration = Math.max(0, ticks);
++    }
++
++    /**
++     * Returns the ticks the water block stays active when the bot is in lava.
++     * Default: 60 ticks (3 s).
++     */
++    public int getWaterLavaStayTicks() {
++        return waterLavaStayTicks;
++    }
++
++    /**
++     * Sets how long (in ticks) the water source block stays on the ground when
++     * the bot's feet or head are in lava.
++     *
++     * <p>Increase this value for deep lava pools; the bot needs enough contact
++     * time with water to extinguish and swim out before the source is removed.</p>
++     *
++     * @param ticks non-negative tick count; minimum effective value is 1
++     */
++    public void setWaterLavaStayTicks(int ticks) {
++        this.waterLavaStayTicks = Math.max(1, ticks);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Reach
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Returns the current melee reach of this bot in blocks (default 3.5).
++     *
++     * @return reach in blocks (always positive)
++     */
++    public double getAttackRange() {
++        return Math.sqrt(attackRangeSq);
++    }
++
++    /**
++     * Sets the per-clone melee reach.
++     *
++     * <p>Changes take effect on the next tick.  Also widens or narrows the
++     * "out-of-range" window used by the swimming and airborne movement phases,
++     * so the bot starts closing distance to the target sooner or later.</p>
++     *
++     * <p><b>Impact CPU :</b> none — the reach only changes the squared-distance
++     * comparison in {@code tryAttack()} and {@code moveTowardTarget()}, both O(1).
++     * <b>Compatibilité plugins :</b> server-side only; client-side reach checks for
++     * real players are unaffected.</p>
++     *
++     * @param blocks positive reach in blocks; clamped to [0.5, 20]
++     */
++    public void setAttackRange(double blocks) {
++        double clamped = Math.max(0.5, Math.min(20.0, blocks));
++        this.attackRangeSq = clamped * clamped;
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Skin
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Installs a custom skin from a Minecraft texture URL.
++     *
++     * <p>Builds and Base64-encodes the textures JSON internally:</p>
++     * <pre>
++     * {"textures":{"SKIN":{"url":"&lt;skinUrl&gt;"[,"metadata":{"model":"slim"}]}
++     *             [,"CAPE":{"url":"&lt;capeUrl&gt;"}]}}
++     * </pre>
++     *
++     * <p>Because no Mojang signature is generated here, the skin is unsigned.
++     * This works on most Bungeecord / offline servers.  For online-mode servers
++     * fetch a signed property from the Mojang session API and use
++     * {@link #setSkinRaw(String, String)} instead.</p>
++     *
++     * <p>If the bot is already in the world, nearby observers will see the skin
++     * change immediately (brief despawn + respawn flicker).</p>
++     *
++     * @param skinUrl  Minecraft texture URL,
++     *                 e.g. {@code "http://textures.minecraft.net/texture/abc123"}
++     * @param slim     {@code true} for the Alex (slim-arms) model,
++     *                 {@code false} for Steve
++     * @param capeUrl  Cape texture URL, or {@code null} / {@code ""} for no cape
++     */
++    public void setSkin(String skinUrl, boolean slim, String capeUrl) {
++        if (skinUrl == null || skinUrl.isEmpty()) {
++            clearSkin();
++            return;
++        }
++        // Build the textures JSON manually — no external JSON lib needed.
++        StringBuilder json = new StringBuilder(128);
++        json.append("{\"textures\":{\"SKIN\":{\"url\":\"").append(skinUrl).append("\"");
++        if (slim) {
++            json.append(",\"metadata\":{\"model\":\"slim\"}");
++        }
++        json.append("}");
++        if (capeUrl != null && !capeUrl.isEmpty()) {
++            json.append(",\"CAPE\":{\"url\":\"").append(capeUrl).append("\"}");
++        }
++        json.append("}}");
++
++        this.skinSlimModel   = slim;
++        this.capeTextureUrl  = (capeUrl != null && !capeUrl.isEmpty()) ? capeUrl : null;
++        this.skinSignature   = null; // unsigned
++        this.skinTextureValue = Base64.getEncoder().encodeToString(
++                json.toString().getBytes(StandardCharsets.UTF_8));
++
++        applySkinToProfile();
++        refreshTracking();
++    }
++
++    /**
++     * Installs a pre-signed skin profile property obtained from the Mojang
++     * session API (e.g. via {@code GET /session/minecraft/profile/<uuid>?unsigned=false}).
++     *
++     * <p>Use this when the server runs in online mode and clients verify the
++     * Mojang signature.  The {@code value} is the Base64-encoded textures JSON
++     * already returned by the API, and {@code signature} is the RSA-SHA1 signature
++     * also returned by the API.</p>
++     *
++     * <p>Pass {@code null} as {@code signature} to install the property unsigned
++     * (works the same as {@link #setSkin(String, boolean, String)} from the game's
++     * perspective).</p>
++     *
++     * @param value     Base64-encoded textures JSON (from Mojang API {@code value} field)
++     * @param signature RSA-SHA1 signature (from Mojang API {@code signature} field),
++     *                  or {@code null}
++     */
++    public void setSkinRaw(String value, String signature) {
++        if (value == null || value.isEmpty()) {
++            clearSkin();
++            return;
++        }
++        this.skinTextureValue = value;
++        this.skinSignature    = signature;
++        // Cannot infer slim/cape from raw value without decoding JSON — leave as-is.
++        applySkinToProfile();
++        refreshTracking();
++    }
++
++    /**
++     * Removes the custom skin, restoring the default Steve appearance.
++     *
++     * <p>All skin-related fields are reset and the {@code "textures"} property is
++     * removed from the GameProfile.  If the bot is in the world, observers see
++     * the change immediately.</p>
++     */
++    public void clearSkin() {
++        this.skinTextureValue = null;
++        this.skinSignature    = null;
++        this.skinSlimModel    = false;
++        this.capeTextureUrl   = null;
++        applySkinToProfile();
++        refreshTracking();
++    }
++
++    /** Returns {@code true} if a custom skin is currently installed. */
++    public boolean hasSkin() {
++        return skinTextureValue != null;
++    }
++
++    /**
++     * Returns the Base64-encoded textures JSON currently set on this bot's
++     * profile, or {@code null} if no custom skin is installed.
++     */
++    public String getSkinTextureValue() {
++        return skinTextureValue;
++    }
++
++    /**
++     * Returns the Mojang signature for the current skin property,
++     * or {@code null} if the skin is unsigned or none is installed.
++     */
++    public String getSkinSignature() {
++        return skinSignature;
++    }
++
++    /**
++     * Returns {@code true} if the current skin uses the slim-arm (Alex) model.
++     * Only meaningful when a skin was installed via {@link #setSkin}.
++     */
++    public boolean isSkinSlim() {
++        return skinSlimModel;
++    }
++
++    /**
++     * Returns the cape texture URL currently embedded in the skin, or {@code null}
++     * if no cape is set.  Only meaningful when a skin was installed via
++     * {@link #setSkin}.
++     */
++    public String getCapeTextureUrl() {
++        return capeTextureUrl;
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/EntityHuman.java b/src/main/java/net/minecraft/server/EntityHuman.java
+index 524ff60ada7392ec1fd803661f957c19c50b2c2e..951723b2f9484c877a7e44045f984a99dac9f9c6 100644
+--- a/src/main/java/net/minecraft/server/EntityHuman.java
++++ b/src/main/java/net/minecraft/server/EntityHuman.java
+@@ -644,31 +644,33 @@ public abstract class EntityHuman extends EntityLiving {
+         }
+ 
+         if (this.hasEffect(MobEffectList.FASTER_DIG)) {
+-            f *= 1.0F + (float) (this.getEffect(MobEffectList.FASTER_DIG).getAmplifier() + 1) * 0.2F;
++            int hasteAmp = this.getEffect(MobEffectList.FASTER_DIG).getAmplifier();
++            // Sukkit start - PotionEfficiencyManager: raw dig fraction added per level (vanilla = 0.2)
++            Double hasteEff = org.bukkit.potion.PotionEfficiencyManager.getEfficiencyById(this.getUniqueID(), MobEffectList.FASTER_DIG.id);
++            f *= (hasteEff != null)
++                    ? 1.0F + (float)(hasteEff * (hasteAmp + 1))
++                    : 1.0F + (float)(hasteAmp + 1) * 0.2F; // vanilla
++            // Sukkit end
+         }
+ 
+         if (this.hasEffect(MobEffectList.SLOWER_DIG)) {
+-            float f1 = 1.0F;
+-
+-            switch (this.getEffect(MobEffectList.SLOWER_DIG).getAmplifier()) {
+-            case 0:
+-                f1 = 0.3F;
+-                break;
+-
+-            case 1:
+-                f1 = 0.09F;
+-                break;
+-
+-            case 2:
+-                f1 = 0.0027F;
+-                break;
+-
+-            case 3:
+-            default:
+-                f1 = 8.1E-4F;
++            int fatigueAmp = this.getEffect(MobEffectList.SLOWER_DIG).getAmplifier();
++            // Sukkit start - PotionEfficiencyManager: base factor per level (vanilla = 0.3, i.e. 0.3^level)
++            Double fatigueEff = org.bukkit.potion.PotionEfficiencyManager.getEfficiencyById(this.getUniqueID(), MobEffectList.SLOWER_DIG.id);
++            if (fatigueEff != null) {
++                f *= (float) Math.pow(fatigueEff, fatigueAmp + 1);
++            } else {
++                // vanilla switch
++                float f1;
++                switch (fatigueAmp) {
++                case 0:  f1 = 0.3F;    break;
++                case 1:  f1 = 0.09F;   break;
++                case 2:  f1 = 0.0027F; break;
++                default: f1 = 8.1E-4F; break;
++                }
++                f *= f1;
+             }
+-
+-            f *= f1;
++            // Sukkit end
+         }
+ 
+         if (this.a(Material.WATER) && !EnchantmentManager.j(this)) {
+@@ -984,6 +986,11 @@ public abstract class EntityHuman extends EntityLiving {
+                 if (f > 0.0F || f1 > 0.0F) {
+                     boolean flag = !world.paperSpigotConfig.disablePlayerCrits && this.fallDistance > 0.0F && !this.onGround && !this.k_() && !this.V() && !this.hasEffect(MobEffectList.BLINDNESS) && this.vehicle == null && entity instanceof EntityLiving; // PaperSpigot
+ 
++                    // Sukkit start - capture pre-crit values for PlayerReceiveDamageEvent
++                    float preMultiplierBase = f;
++                    float critMult = 1.5F;
++                    // Sukkit end
++
+                     if (flag && f > 0.0F) {
+                         f *= 1.5F;
+                     }
+@@ -1007,7 +1014,11 @@ public abstract class EntityHuman extends EntityLiving {
+                     double d0 = entity.motX;
+                     double d1 = entity.motY;
+                     double d2 = entity.motZ;
+-                    boolean flag2 = entity.damageEntity(DamageSource.playerAttack(this), f);
++                    // Sukkit start - use PlayerAttackDamageSource to carry breakdown
++                    PlayerAttackDamageSource attackSource = new PlayerAttackDamageSource(
++                            this, preMultiplierBase, f1, flag, critMult, i);
++                    boolean flag2 = entity.damageEntity(attackSource, f);
++                    // Sukkit end
+ 
+                     if (flag2) {
+                         if (i > 0) {
+@@ -1040,10 +1051,17 @@ public abstract class EntityHuman extends EntityLiving {
+ 
+                             if (!cancelled) {
+                                 ( (EntityPlayer) entity ).playerConnection.sendPacket( new PacketPlayOutEntityVelocity( entity ) );
+-                                entity.velocityChanged = false;
+-                                entity.motX = d0;
+-                                entity.motY = d1;
+-                                entity.motZ = d2;
++                                // Sukkit start — FakePlayer: no real client receives the velocity packet,
++                                // so we must NOT restore the pre-knockback motion.  Keep velocityChanged=true
++                                // so the entity tracker can broadcast the impulse to observing players, and
++                                // keep motX/Y/Z at the knockback values so server-side physics can apply them.
++                                if (!(entity instanceof EntityFakePlayer)) {
++                                    entity.velocityChanged = false;
++                                    entity.motX = d0;
++                                    entity.motY = d1;
++                                    entity.motZ = d2;
++                                }
++                                // Sukkit end
+                             }
+                             // CraftBukkit end
+                         }
+diff --git a/src/main/java/net/minecraft/server/EntityLiving.java b/src/main/java/net/minecraft/server/EntityLiving.java
+index 32752dfad24bc7883b1ab52e29834f1aa6fa60c6..1752c6c5ca6f73896afcac88fec2fd2d8e411215 100644
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -592,6 +592,14 @@ public abstract class EntityLiving extends Entity {
+         }
+         // CraftBukkit end
+         if (this.d(mobeffect)) {
++            // Sukkit start - PotionAddedEvent
++            if (!this.world.isClientSide) {
++                org.bukkit.event.entity.PotionAddedEvent event = org.bukkit.craftbukkit.event.CraftEventFactory.callPotionAddedEvent(this, mobeffect);
++                if (event.isCancelled()) {
++                    return;
++                }
++            }
++            // Sukkit end
+             if (this.effects.containsKey(Integer.valueOf(mobeffect.getEffectId()))) {
+                 ((MobEffect) this.effects.get(Integer.valueOf(mobeffect.getEffectId()))).a(mobeffect);
+                 this.a((MobEffect) this.effects.get(Integer.valueOf(mobeffect.getEffectId())), true);
+@@ -629,6 +637,11 @@ public abstract class EntityLiving extends Entity {
+         MobEffect mobeffect = (MobEffect) this.effects.remove(Integer.valueOf(i));
+ 
+         if (mobeffect != null) {
++            // Sukkit start - PotionRemovedEvent
++            if (!this.world.isClientSide) {
++                org.bukkit.craftbukkit.event.CraftEventFactory.callPotionRemovedEvent(this, mobeffect);
++            }
++            // Sukkit end
+             this.b(mobeffect);
+         }
+ 
+@@ -819,6 +832,23 @@ public abstract class EntityLiving extends Entity {
+                         this.makeSound(s, this.bB(), this.bC());
+                     }
+ 
++                    // Sukkit start - PlayerFatalHitEvent
++                    // Fires before die() so plugins can intercept the death and manage
++                    // their own death pipeline (e.g. delayed-death / spectator window).
++                    if (this instanceof EntityPlayer) {
++                        org.bukkit.entity.Player bPlayer = (org.bukkit.entity.Player) this.getBukkitEntity();
++                        org.bukkit.entity.Entity bKiller = (damagesource.getEntity() != null)
++                                ? damagesource.getEntity().getBukkitEntity() : null;
++                        org.bukkit.event.entity.PlayerFatalHitEvent fatalEvent =
++                                new org.bukkit.event.entity.PlayerFatalHitEvent(bPlayer, bKiller, this.lastDamage);
++                        this.world.getServer().getPluginManager().callEvent(fatalEvent);
++                        if (fatalEvent.isCancelled()) {
++                            this.setHealth(fatalEvent.getSurvivalHealth());
++                            return true;
++                        }
++                    }
++                    // Sukkit end
++
+                     this.die(damagesource);
+                 } else {
+                     s = this.bo();
+@@ -1086,7 +1116,16 @@ public abstract class EntityLiving extends Entity {
+                 @Override
+                 public Double apply(Double f) {
+                     if (!damagesource.isStarvation() && EntityLiving.this.hasEffect(MobEffectList.RESISTANCE) && damagesource != DamageSource.OUT_OF_WORLD) {
+-                        int i = (EntityLiving.this.getEffect(MobEffectList.RESISTANCE).getAmplifier() + 1) * 5;
++                        int amp = EntityLiving.this.getEffect(MobEffectList.RESISTANCE).getAmplifier();
++                        // Sukkit start - PotionEfficiencyManager: raw % reduction per level
++                        java.util.UUID effUuid = (EntityLiving.this instanceof EntityPlayer) ? EntityLiving.this.getUniqueID() : null;
++                        Double efficiency = org.bukkit.potion.PotionEfficiencyManager.getEfficiencyById(effUuid, MobEffectList.RESISTANCE.id);
++                        if (efficiency != null) {
++                            float reduction = (float) Math.min(1.0, efficiency * (amp + 1));
++                            return -(f * reduction);
++                        }
++                        // Sukkit end - vanilla fallback
++                        int i = (amp + 1) * 5;
+                         int j = 25 - i;
+                         float f1 = f.floatValue() * (float) j;
+                         return -(f - (f1 / 25.0F));
+@@ -1114,6 +1153,40 @@ public abstract class EntityLiving extends Entity {
+             };
+             float absorptionModifier = absorption.apply((double) f).floatValue();
+ 
++            // Sukkit start - PlayerReceiveDamageEvent: expose all components when victim is a player
++            if (this instanceof EntityPlayer && !this.world.isClientSide) {
++                org.bukkit.event.entity.PlayerReceiveDamageEvent prde =
++                        org.bukkit.craftbukkit.event.CraftEventFactory.callPlayerReceiveDamageEvent(
++                                (EntityPlayer) this, damagesource, originalDamage,
++                                hardHatModifier, blockingModifier, armorModifier,
++                                resistanceModifier, magicModifier, absorptionModifier);
++
++                if (prde.isCancelled()) {
++                    return false;
++                }
++
++                // Rebuild modifier values from the event in case the plugin changed them.
++                // Provide constant lambdas so EntityDamageEvent reflects the overridden values.
++                originalDamage      = prde.getRawIncomingDamage();
++                hardHatModifier     = -prde.getHardHatReduction();
++                blockingModifier    = -prde.getBlockingReduction();
++                armorModifier       = -prde.getArmorReduction();
++                resistanceModifier  = -prde.getResistanceReduction();
++                magicModifier       = -prde.getMagicReduction();
++                absorptionModifier  = -prde.getAbsorptionReduction();
++
++                final double _hh = hardHatModifier, _bl = blockingModifier,
++                        _ar = armorModifier, _re = resistanceModifier,
++                        _ma = magicModifier,  _ab = absorptionModifier;
++                hardHat    = (d) -> _hh;
++                blocking   = (d) -> _bl;
++                armor      = (d) -> _ar;
++                resistance = (d) -> _re;
++                magic      = (d) -> _ma;
++                absorption = (d) -> _ab;
++            }
++            // Sukkit end
++
+             EntityDamageEvent event = CraftEventFactory.handleLivingEntityDamageEvent(this, damagesource, originalDamage, hardHatModifier, blockingModifier, armorModifier, resistanceModifier, magicModifier, absorptionModifier, hardHat, blocking, armor, resistance, magic, absorption);
+             if (event.isCancelled()) {
+                 return false;
+@@ -1316,7 +1389,14 @@ public abstract class EntityLiving extends Entity {
+ 
+         this.motY = (double) this.bE();
+         if (this.hasEffect(MobEffectList.JUMP)) {
+-            this.motY += (double) ((float) (this.getEffect(MobEffectList.JUMP).getAmplifier() + 1) * 0.1F);
++            int jumpAmp = this.getEffect(MobEffectList.JUMP).getAmplifier();
++            // Sukkit start - PotionEfficiencyManager: raw motY per level
++            java.util.UUID jumpUuid = (this instanceof EntityPlayer) ? this.getUniqueID() : null;
++            Double jumpEff = org.bukkit.potion.PotionEfficiencyManager.getEfficiencyById(jumpUuid, MobEffectList.JUMP.id);
++            this.motY += (jumpEff != null)
++                    ? jumpEff * (jumpAmp + 1)
++                    : (double) ((float) (jumpAmp + 1) * 0.1F); // vanilla
++            // Sukkit end
+         }
+ 
+         if (canCrit && this.isSprinting()) { // PandaSpigot - Backport ArrowDMG fix
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 6f804d5b1eaa085366b5213a98bc412cada1f078..66812fdec3bf7c4201fda23067528251e9c870c0 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -51,6 +51,18 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+     public int ping;
+     public boolean viewingCredits;
+ 
++    // Sukkit start - WeebEffects (armor NBT passive effects)
++    /**
++     * Effects currently maintained by WeebEffects NBT on equipped armor.
++     * Key = Minecraft effect ID, Value = amplifier (0-based).
++     * Recomputed by {@link #tickWeebArmorEffects()} every 10 ticks and on every
++     * armor-slot change via {@link #onArmorSlotChanged()}.
++     */
++    private final java.util.Map<Integer, Integer> weebArmorEffects = new java.util.HashMap<>();
++    /** Tick counter for the 10-tick WeebEffects refresh cycle. */
++    private int weebEffectTick = 0;
++    // Sukkit end
++
+     // CraftBukkit start
+     public String displayName;
+     public net.kyori.adventure.text.Component adventure$displayName; // PandaSpigot - Adventure
+@@ -197,6 +209,81 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+         this.playerConnection.sendPacket(new PacketPlayOutCombatEvent(this.bs(), PacketPlayOutCombatEvent.EnumCombatEventType.END_COMBAT));
+     }
+ 
++    // Sukkit start - WeebEffects from armor NBT
++    /**
++     * Called by {@link PlayerInventory} whenever an armor slot changes so that effects
++     * are updated in the same tick rather than waiting for the next 10-tick window.
++     */
++    public void onArmorSlotChanged() {
++        weebEffectTick = 0; // reset timer so the next full cycle starts fresh
++        tickWeebArmorEffects();
++    }
++
++    /**
++     * Scans all equipped armor for {@code WeebEffects} NBT, applies/refreshes the
++     * desired effects, and removes any that are no longer provided.
++     *
++     * <p>NBT format per armor piece:
++     * <pre>
++     * WeebEffects: [
++     *   { Id: 1b, Amplifier: 0b }   // Speed I
++     * ]
++     * </pre>
++     *
++     * <p>Effects are applied with a 20-tick duration and refreshed every 10 ticks,
++     * so they never visually expire while the armor is worn. When armor is removed,
++     * the effect expires naturally within 20 ticks — or is removed immediately here
++     * if the previous amplifier matches what we applied (to avoid cancelling a stronger
++     * natural potion of the same type).
++     */
++    private void tickWeebArmorEffects() {
++        // Collect desired effects: effectId → max amplifier across all armor slots
++        java.util.Map<Integer, Integer> desired = new java.util.HashMap<>();
++
++        for (ItemStack armor : this.inventory.armor) {
++            if (armor == null) continue;
++            NBTTagCompound tag = armor.getTag();
++            if (tag == null || !tag.hasKey("WeebEffects")) continue;
++            NBTTagList list = tag.getList("WeebEffects", 10 /* TAG_Compound */);
++            for (int j = 0; j < list.size(); j++) {
++                NBTTagCompound e = list.get(j);
++                int id  = e.getByte("Id") & 0xFF;
++                int amp = e.getByte("Amplifier") & 0xFF;
++                desired.merge(id, amp, Math::max);
++            }
++        }
++
++        // Apply / refresh desired effects.
++        // Duration 20 ticks (1 s), refreshed every 10 ticks — never visibly expires.
++        for (java.util.Map.Entry<Integer, Integer> entry : desired.entrySet()) {
++            int id  = entry.getKey();
++            int amp = entry.getValue();
++            this.addEffect(new MobEffect(id, 20, amp, false /* ambient */, false /* particles */));
++        }
++
++        // Remove effects that are no longer provided by any equipped armor piece,
++        // but only if the current amplifier matches what WeebEffects originally applied
++        // (avoids removing a stronger natural potion of the same type).
++        java.util.Iterator<java.util.Map.Entry<Integer, Integer>> iter =
++                weebArmorEffects.entrySet().iterator();
++        while (iter.hasNext()) {
++            java.util.Map.Entry<Integer, Integer> entry = iter.next();
++            int id = entry.getKey();
++            if (!desired.containsKey(id)) {
++                MobEffect current = (MobEffect) this.effects.get(id);
++                if (current != null && current.getAmplifier() == entry.getValue()) {
++                    this.removeEffect(id);
++                }
++                iter.remove();
++            }
++        }
++
++        // Sync tracking map
++        weebArmorEffects.clear();
++        weebArmorEffects.putAll(desired);
++    }
++    // Sukkit end
++
+     public void t_() {
+         // CraftBukkit start
+         if (this.joining) {
+@@ -205,6 +292,13 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+         // CraftBukkit end
+         this.playerInteractManager.a();
+         --this.invulnerableTicks;
++
++        // Sukkit start - WeebEffects periodic refresh (every 10 ticks = 0.5 s)
++        if (++weebEffectTick >= 10) {
++            weebEffectTick = 0;
++            this.tickWeebArmorEffects();
++        }
++        // Sukkit end
+         if (this.noDamageTicks > 0) {
+             --this.noDamageTicks;
+         }
+diff --git a/src/main/java/net/minecraft/server/EntityPotion.java b/src/main/java/net/minecraft/server/EntityPotion.java
+index fd174c346d0c31f6f4e3b724d84ca1df600d73ff..c79891fdd1d55505481dfe19a7a22240deae5802 100644
+--- a/src/main/java/net/minecraft/server/EntityPotion.java
++++ b/src/main/java/net/minecraft/server/EntityPotion.java
+@@ -120,7 +120,7 @@ public class EntityPotion extends EntityProjectile {
+                                     int j = (int) (d1 * (double) mobeffect.getDuration() + 0.5D);
+ 
+                                     if (j > 20) {
+-                                        entityliving.addEffect(new MobEffect(i, j, mobeffect.getAmplifier()));
++                                        entityliving.addEffect(new MobEffect(i, j, mobeffect.getAmplifier()).setSource(this.getShooter() != null ? this.getShooter() : this));
+                                     }
+                                 }
+                             }
+diff --git a/src/main/java/net/minecraft/server/EntityTrackerEntry.java b/src/main/java/net/minecraft/server/EntityTrackerEntry.java
+index 0b90b6f30ea09fb117281d5ddd2fc752d2c139b5..f12eb3c3178aa36bd857c438a068115853401f4b 100644
+--- a/src/main/java/net/minecraft/server/EntityTrackerEntry.java
++++ b/src/main/java/net/minecraft/server/EntityTrackerEntry.java
+@@ -321,6 +321,14 @@ public class EntityTrackerEntry {
+             EntityPlayer entityplayer = (EntityPlayer) iterator.next();
+ 
+             entityplayer.d(this.tracker);
++            // Sukkit start - FakePlayer: remove tab-list entry added in updatePlayer
++            if (this.tracker instanceof EntityFakePlayer) {
++                entityplayer.playerConnection.sendPacket(
++                    new PacketPlayOutPlayerInfo(
++                        PacketPlayOutPlayerInfo.EnumPlayerInfoAction.REMOVE_PLAYER,
++                        (EntityPlayer) this.tracker));
++            }
++            // Sukkit end
+         }
+ 
+     }
+@@ -329,6 +337,14 @@ public class EntityTrackerEntry {
+         if (this.trackedPlayers.contains(entityplayer)) {
+             entityplayer.d(this.tracker);
+             this.trackedPlayers.remove(entityplayer);
++            // Sukkit start - FakePlayer: remove tab-list entry added in updatePlayer
++            if (this.tracker instanceof EntityFakePlayer) {
++                entityplayer.playerConnection.sendPacket(
++                    new PacketPlayOutPlayerInfo(
++                        PacketPlayOutPlayerInfo.EnumPlayerInfoAction.REMOVE_PLAYER,
++                        (EntityPlayer) this.tracker));
++            }
++            // Sukkit end
+         }
+ 
+     }
+@@ -351,6 +367,19 @@ public class EntityTrackerEntry {
+                     this.trackedPlayerMap.put(entityplayer, true); // PaperBukkit
+                     Packet packet = this.c();
+ 
++                    // Sukkit start - FakePlayer visibility: the client requires a
++                    // PacketPlayOutPlayerInfo(ADD_PLAYER) before it can render a
++                    // PacketPlayOutNamedEntitySpawn.  Real players get this from
++                    // PlayerList during login; fake players never do, so we send
++                    // it here every time a real player enters tracking range.
++                    if (this.tracker instanceof EntityFakePlayer) {
++                        entityplayer.playerConnection.sendPacket(
++                            new PacketPlayOutPlayerInfo(
++                                PacketPlayOutPlayerInfo.EnumPlayerInfoAction.ADD_PLAYER,
++                                (EntityPlayer) this.tracker));
++                    }
++                    // Sukkit end
++
+                     entityplayer.playerConnection.sendPacket(packet);
+                     if (!this.tracker.getDataWatcher().d()) {
+                         entityplayer.playerConnection.sendPacket(new PacketPlayOutEntityMetadata(this.tracker.getId(), this.tracker.getDataWatcher(), true));
+diff --git a/src/main/java/net/minecraft/server/FakeNetworkManager.java b/src/main/java/net/minecraft/server/FakeNetworkManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab4f6e7b56ce2a5ec881ad3ebd588e4fb98b0179
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/FakeNetworkManager.java
+@@ -0,0 +1,64 @@
++package net.minecraft.server;
++
++import io.netty.channel.embedded.EmbeddedChannel;
++import io.netty.util.concurrent.Future;
++import io.netty.util.concurrent.GenericFutureListener;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++
++/**
++ * A no-operation {@link NetworkManager} used by {@link EntityFakePlayer}.
++ *
++ * <p>Uses a Netty {@link EmbeddedChannel} so that all {@code channel != null}
++ * and {@code channel.isOpen()} guards in NetworkManager pass without creating
++ * a real socket.  All packet-sending paths are overridden to no-ops so the
++ * server never serializes a packet for a fake player.</p>
++ *
++ * <h3>Thread safety</h3>
++ * EmbeddedChannel is single-threaded by design (uses its own EventLoop), but
++ * we never actually write to it.  All overridden methods are no-ops, so there
++ * is no threading concern.
++ */
++public class FakeNetworkManager extends NetworkManager {
++
++    public FakeNetworkManager() {
++        super(EnumProtocolDirection.SERVERBOUND);
++        // EmbeddedChannel: fully functional Netty channel backed by in-memory
++        // buffers.  channel.isOpen() returns true until explicitly closed.
++        this.channel = new EmbeddedChannel();
++        this.l = new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
++        this.preparing = false;
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Packet dispatch — all suppressed
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Called by {@link PlayerConnection#sendPacket}.  No-op for fake players.
++     */
++    @Override
++    public void handle(Packet packet) {
++        // No-op: there is no real client to receive this packet.
++    }
++
++    /**
++     * Called by the flush-consolidation path.  No-op for fake players.
++     */
++    @Override
++    public void a(Packet packet,
++                  GenericFutureListener<? extends Future<? super Void>> genericfuturelistener,
++                  GenericFutureListener<? extends Future<? super Void>>... agenericfuturelistener) {
++        // No-op: there is no real client to receive this packet.
++    }
++
++    /**
++     * Override the NetworkManager tick (called from ServerConnection.c()).
++     * We are NOT registered with ServerConnection, so this is never called;
++     * the override is here as a safety net.
++     */
++    @Override
++    public void a() {
++        // No-op: fake network manager is not in ServerConnection's manager list.
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/FakePlayerConnection.java b/src/main/java/net/minecraft/server/FakePlayerConnection.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2c7b448f7f6afbb04ac40b7e973bdedd9ccbf76
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/FakePlayerConnection.java
+@@ -0,0 +1,62 @@
++package net.minecraft.server;
++
++/**
++ * A no-operation {@link PlayerConnection} used by {@link EntityFakePlayer}.
++ *
++ * <p>All methods that would interact with a real network connection or client
++ * are suppressed.  The tick method {@link #c()} is intentionally a no-op
++ * because fake players don't need keepAlive, chat throttle, or idle-kick
++ * processing.</p>
++ *
++ * <h3>CPU impact</h3>
++ * Since {@code sendPacket} is a no-op, the server never serializes packets for
++ * fake players.  {@code c()} is a no-op so the server doesn't waste time on
++ * keepAlive or idle logic.  The only overhead is from the entity tick itself.
++ */
++public class FakePlayerConnection extends PlayerConnection {
++
++    public FakePlayerConnection(MinecraftServer server,
++                                 FakeNetworkManager networkManager,
++                                 EntityFakePlayer fakePlayer) {
++        super(server, networkManager, fakePlayer);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Packet sending — suppressed
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * All packets destined for the fake player are silently dropped.
++     * This is the primary cost-reduction point: no serialization, no I/O.
++     */
++    @Override
++    public void sendPacket(final Packet packet) {
++        // No-op: fake player has no real client.
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // IUpdatePlayerListBox tick — suppressed
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Suppressed: keepAlive packets, chat throttle, idle kick — all irrelevant
++     * for server-controlled entities.
++     */
++    @Override
++    public void c() {
++        // No-op.
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Disconnect — suppressed
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Disconnect requests are silently ignored.  Fake players are removed via
++     * {@link org.bukkit.craftbukkit.fakeplayer.FakePlayerManager#remove}.
++     */
++    @Override
++    public void disconnect(IChatBaseComponent reason) {
++        // No-op: use FakePlayerManager.remove() instead.
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/MobEffect.java b/src/main/java/net/minecraft/server/MobEffect.java
+index c9f433f83e6393c1061acb73e12e25b32674d611..f40d575760030dd0ad50b0f0809ef4af2430b27b 100644
+--- a/src/main/java/net/minecraft/server/MobEffect.java
++++ b/src/main/java/net/minecraft/server/MobEffect.java
+@@ -12,6 +12,7 @@ public class MobEffect {
+     private boolean splash;
+     private boolean ambient;
+     private boolean particles;
++    private Entity source;
+ 
+     public MobEffect(int i, int j) {
+         this(i, j, 0);
+@@ -35,6 +36,16 @@ public class MobEffect {
+         this.amplification = mobeffect.amplification;
+         this.ambient = mobeffect.ambient;
+         this.particles = mobeffect.particles;
++        this.source = mobeffect.source;
++    }
++
++    public Entity getSource() {
++        return this.source;
++    }
++
++    public MobEffect setSource(Entity source) {
++        this.source = source;
++        return this;
+     }
+ 
+     public void a(MobEffect mobeffect) {
+diff --git a/src/main/java/net/minecraft/server/MobEffectAbsorption.java b/src/main/java/net/minecraft/server/MobEffectAbsorption.java
+index bd781a37f087038ebd89d64fa1769220424bf415..b5525d4f3b9c218cde8bb35b45f4ac08bacda07d 100644
+--- a/src/main/java/net/minecraft/server/MobEffectAbsorption.java
++++ b/src/main/java/net/minecraft/server/MobEffectAbsorption.java
+@@ -8,13 +8,23 @@ public class MobEffectAbsorption extends MobEffectList {
+ 
+     @Override
+     public void a(EntityLiving entityliving, AttributeMapBase attributemapbase, int i) {
+-        entityliving.setAbsorptionHearts(entityliving.getAbsorptionHearts() - (float) (4 * (i + 1)));
++        // Sukkit start - PotionEfficiencyManager: raw absorption hearts per level (vanilla = 4)
++        java.util.UUID absUuid = (entityliving instanceof EntityPlayer) ? entityliving.getUniqueID() : null;
++        Double absEff = org.bukkit.potion.PotionEfficiencyManager.getEfficiencyById(absUuid, this.id);
++        float removed = (absEff != null) ? (float)(absEff * (i + 1)) : (float)(4 * (i + 1));
++        // Sukkit end
++        entityliving.setAbsorptionHearts(entityliving.getAbsorptionHearts() - removed);
+         super.a(entityliving, attributemapbase, i);
+     }
+ 
+     @Override
+     public void b(EntityLiving entityliving, AttributeMapBase attributemapbase, int i) {
+-        entityliving.setAbsorptionHearts(entityliving.getAbsorptionHearts() + (float) (4 * (i + 1)));
++        // Sukkit start - PotionEfficiencyManager: raw absorption hearts per level (vanilla = 4)
++        java.util.UUID absUuid = (entityliving instanceof EntityPlayer) ? entityliving.getUniqueID() : null;
++        Double absEff = org.bukkit.potion.PotionEfficiencyManager.getEfficiencyById(absUuid, this.id);
++        float added = (absEff != null) ? (float)(absEff * (i + 1)) : (float)(4 * (i + 1));
++        // Sukkit end
++        entityliving.setAbsorptionHearts(entityliving.getAbsorptionHearts() + added);
+         super.b(entityliving, attributemapbase, i);
+     }
+ }
+diff --git a/src/main/java/net/minecraft/server/MobEffectList.java b/src/main/java/net/minecraft/server/MobEffectList.java
+index 863e9d8e9317debda291a1a91bc181f2d27db657..7700f367c298e089bc4c20745803f1ad28eb1675 100644
+--- a/src/main/java/net/minecraft/server/MobEffectList.java
++++ b/src/main/java/net/minecraft/server/MobEffectList.java
+@@ -90,25 +90,35 @@ public class MobEffectList {
+     }
+ 
+     public void tick(EntityLiving entityliving, int i) {
++        // Sukkit start - PotionEfficiencyManager: raw value per level for tick effects
++        java.util.UUID tickUuid = (entityliving instanceof EntityPlayer) ? entityliving.getUniqueID() : null;
++        Double tickEff = org.bukkit.potion.PotionEfficiencyManager.getEfficiencyById(tickUuid, this.id);
++        // Sukkit end
+         if (this.id == MobEffectList.REGENERATION.id) {
+             if (entityliving.getHealth() < entityliving.getMaxHealth()) {
+-                entityliving.heal(1.0F, RegainReason.MAGIC_REGEN); // CraftBukkit
++                float regenAmount = (tickEff != null) ? (float)(tickEff * (i + 1)) : 1.0F; // Sukkit
++                entityliving.heal(regenAmount, RegainReason.MAGIC_REGEN); // CraftBukkit
+             }
+         } else if (this.id == MobEffectList.POISON.id) {
+             if (entityliving.getHealth() > 1.0F) {
+-                entityliving.damageEntity(CraftEventFactory.POISON, 1.0F);  // CraftBukkit - DamageSource.MAGIC -> CraftEventFactory.POISON
++                float poisonAmount = (tickEff != null) ? (float)(tickEff * (i + 1)) : 1.0F; // Sukkit
++                entityliving.damageEntity(CraftEventFactory.POISON, poisonAmount); // CraftBukkit
+             }
+         } else if (this.id == MobEffectList.WITHER.id) {
+-            entityliving.damageEntity(DamageSource.WITHER, 1.0F);
++            float witherAmount = (tickEff != null) ? (float)(tickEff * (i + 1)) : 1.0F; // Sukkit
++            entityliving.damageEntity(DamageSource.WITHER, witherAmount);
+         } else if (this.id == MobEffectList.HUNGER.id && entityliving instanceof EntityHuman) {
+-            ((EntityHuman) entityliving).applyExhaustion(0.025F * (float) (i + 1));
++            // Sukkit: raw exhaustion per level (vanilla = 0.025)
++            float hungerAmount = (tickEff != null) ? (float)(tickEff * (i + 1)) : 0.025F * (float)(i + 1);
++            ((EntityHuman) entityliving).applyExhaustion(hungerAmount);
+         } else if (this.id == MobEffectList.SATURATION.id && entityliving instanceof EntityHuman) {
+             if (!entityliving.world.isClientSide) {
+                 // CraftBukkit start
+                 EntityHuman entityhuman = (EntityHuman) entityliving;
+                 int oldFoodLevel = entityhuman.getFoodData().foodLevel;
+-
+-                org.bukkit.event.entity.FoodLevelChangeEvent event = CraftEventFactory.callFoodLevelChangeEvent(entityhuman, i + 1 + oldFoodLevel);
++                // Sukkit: raw food per level (vanilla = i+1)
++                int foodIncrease = (tickEff != null) ? (int) Math.round(tickEff * (i + 1)) : (i + 1);
++                org.bukkit.event.entity.FoodLevelChangeEvent event = CraftEventFactory.callFoodLevelChangeEvent(entityhuman, foodIncrease + oldFoodLevel);
+ 
+                 if (!event.isCancelled()) {
+                     entityhuman.getFoodData().eat(event.getFoodLevel() - oldFoodLevel, 1.0F);
+@@ -128,11 +138,17 @@ public class MobEffectList {
+     }
+ 
+     public void applyInstantEffect(Entity entity, Entity entity1, EntityLiving entityliving, int i, double d0) {
+-        int j;
++        // Sukkit start - PotionEfficiencyManager: raw HP per level for instant effects
++        java.util.UUID instUuid = (entityliving instanceof EntityPlayer) ? entityliving.getUniqueID() : null;
++        Double instEff = org.bukkit.potion.PotionEfficiencyManager.getEfficiencyById(instUuid, this.id);
++        // Sukkit end
+ 
+         if ((this.id != MobEffectList.HEAL.id || entityliving.bm()) && (this.id != MobEffectList.HARM.id || !entityliving.bm())) {
+             if (this.id == MobEffectList.HARM.id && !entityliving.bm() || this.id == MobEffectList.HEAL.id && entityliving.bm()) {
+-                j = (int) (d0 * (double) (6 << i) + 0.5D);
++                // Sukkit: raw per level (vanilla default: 6 << amp)
++                int j = (instEff != null)
++                        ? (int) (d0 * instEff * (i + 1) + 0.5D)
++                        : (int) (d0 * (double) (6 << i) + 0.5D);
+                 if (entity == null) {
+                     entityliving.damageEntity(DamageSource.MAGIC, (float) j);
+                 } else {
+@@ -140,7 +156,10 @@ public class MobEffectList {
+                 }
+             }
+         } else {
+-            j = (int) (d0 * (double) (4 << i) + 0.5D);
++            // Sukkit: raw per level (vanilla default: 4 << amp)
++            int j = (instEff != null)
++                    ? (int) (d0 * instEff * (i + 1) + 0.5D)
++                    : (int) (d0 * (double) (4 << i) + 0.5D);
+             entityliving.heal((float) j, RegainReason.MAGIC); // CraftBukkit
+         }
+ 
+@@ -216,6 +235,10 @@ public class MobEffectList {
+ 
+     public void b(EntityLiving entityliving, AttributeMapBase attributemapbase, int i) {
+         Iterator iterator = this.J.entrySet().iterator();
++        // Sukkit start - PotionEfficiencyManager: raw attribute value per level
++        java.util.UUID effUuid = (entityliving instanceof EntityPlayer) ? entityliving.getUniqueID() : null;
++        Double efficiency = org.bukkit.potion.PotionEfficiencyManager.getEfficiencyById(effUuid, this.id);
++        // Sukkit end
+ 
+         while (iterator.hasNext()) {
+             Entry entry = (Entry) iterator.next();
+@@ -223,9 +246,12 @@ public class MobEffectList {
+ 
+             if (attributeinstance != null) {
+                 AttributeModifier attributemodifier = (AttributeModifier) entry.getValue();
+-
+                 attributeinstance.c(attributemodifier);
+-                attributeinstance.b(new AttributeModifier(attributemodifier.a(), this.a() + " " + i, this.a(i, attributemodifier), attributemodifier.c()));
++                // Sukkit: when efficiency is set, replace the vanilla per-level coefficient
++                double value = (efficiency != null)
++                        ? efficiency * (i + 1)
++                        : this.a(i, attributemodifier); // vanilla: baseModifier * (amp+1)
++                attributeinstance.b(new AttributeModifier(attributemodifier.a(), this.a() + " " + i, value, attributemodifier.c()));
+             }
+         }
+ 
+diff --git a/src/main/java/net/minecraft/server/PlayerAttackDamageSource.java b/src/main/java/net/minecraft/server/PlayerAttackDamageSource.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b0f0694b1f2069548d994cb8677a54d08ec6ec2
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/PlayerAttackDamageSource.java
+@@ -0,0 +1,39 @@
++package net.minecraft.server;
++
++/**
++ * DamageSource variant for player melee attacks that carries a full breakdown
++ * of how the outgoing damage was computed (used to populate PlayerReceiveDamageEvent).
++ */
++public class PlayerAttackDamageSource extends EntityDamageSource {
++
++    /** Raw attack attribute value before any multiplier */
++    private final float rawBaseDamage;
++    /** Bonus from sharpness / smite / bane of arthropods */
++    private final float enchantmentBonus;
++    /** Whether the hit was a critical hit */
++    private final boolean critical;
++    /** Multiplier applied on a critical hit (vanilla 1.5) */
++    private final float criticalMultiplier;
++    /** Total knockback level (enchantment + sprint bonus) */
++    private final int knockbackLevel;
++
++    public PlayerAttackDamageSource(EntityHuman attacker,
++                                    float rawBaseDamage,
++                                    float enchantmentBonus,
++                                    boolean critical,
++                                    float criticalMultiplier,
++                                    int knockbackLevel) {
++        super("player", attacker);
++        this.rawBaseDamage      = rawBaseDamage;
++        this.enchantmentBonus   = enchantmentBonus;
++        this.critical           = critical;
++        this.criticalMultiplier = criticalMultiplier;
++        this.knockbackLevel     = knockbackLevel;
++    }
++
++    public float getRawBaseDamage()      { return rawBaseDamage; }
++    public float getEnchantmentBonus()   { return enchantmentBonus; }
++    public boolean isCritical()          { return critical; }
++    public float getCriticalMultiplier() { return criticalMultiplier; }
++    public int getKnockbackLevel()       { return knockbackLevel; }
++}
+diff --git a/src/main/java/net/minecraft/server/PlayerInventory.java b/src/main/java/net/minecraft/server/PlayerInventory.java
+index 76fa51d97e9a938d4198bbe657d77900f6327744..0c1b79a78f272caba7a98dfdadeb9090e7b3fd76 100644
+--- a/src/main/java/net/minecraft/server/PlayerInventory.java
++++ b/src/main/java/net/minecraft/server/PlayerInventory.java
+@@ -5,8 +5,11 @@ import java.util.concurrent.Callable;
+ // CraftBukkit start
+ import java.util.List;
+ 
++import org.bukkit.Bukkit;
+ import org.bukkit.craftbukkit.entity.CraftHumanEntity;
++import org.bukkit.craftbukkit.inventory.CraftItemStack;
+ import org.bukkit.entity.HumanEntity;
++import org.bukkit.event.player.PlayerArmorChangeEvent;
+ // CraftBukkit end
+ 
+ public class PlayerInventory implements IInventory {
+@@ -51,6 +54,16 @@ public class PlayerInventory implements IInventory {
+     }
+     // CraftBukkit end
+ 
++    // Sukkit start - armor event reason hint
++    /**
++     * Set this to the appropriate {@link PlayerArmorChangeEvent.ChangeReason} before calling
++     * {@link #setItem} on an armor slot when you know the cause (e.g. PLAYER, DEATH).
++     * Resets to {@code null} automatically after each armor {@link #setItem} call.
++     * Default {@code null} is treated as {@link PlayerArmorChangeEvent.ChangeReason#PLUGIN}.
++     */
++    public PlayerArmorChangeEvent.ChangeReason pendingArmorChangeReason = null;
++    // Sukkit end
++
+     public PlayerInventory(EntityHuman entityhuman) {
+         this.player = entityhuman;
+     }
+@@ -352,15 +365,81 @@ public class PlayerInventory implements IInventory {
+ 
+     public void setItem(int i, ItemStack itemstack) {
+         ItemStack[] aitemstack = this.items;
++        int armorIndex = -1;
+ 
+         if (i >= aitemstack.length) {
+-            i -= aitemstack.length;
++            armorIndex = i - aitemstack.length;
+             aitemstack = this.armor;
++            i = armorIndex;
++        }
++
++        // Sukkit start - WeebBinding + PlayerArmorChangeEvent
++        if (armorIndex >= 0 && this.player instanceof EntityPlayer) {
++            ItemStack oldItem = aitemstack[armorIndex];
++
++            PlayerArmorChangeEvent.ChangeReason reason =
++                    (this.pendingArmorChangeReason != null)
++                    ? this.pendingArmorChangeReason
++                    : PlayerArmorChangeEvent.ChangeReason.PLUGIN;
++            this.pendingArmorChangeReason = null; // consume the hint
++
++            // WeebBinding: silently block PLAYER-initiated removal.
++            // PLUGIN, BREAK, and DEATH bypass binding.
++            if (reason == PlayerArmorChangeEvent.ChangeReason.PLAYER
++                    && weebHasBinding(oldItem)) {
++                return;
++            }
++
++            // Fire the event (BREAK/DEATH are informational — already committed in their
++            // respective callers, so we fire them there, not here).
++            if (reason != PlayerArmorChangeEvent.ChangeReason.BREAK
++                    && reason != PlayerArmorChangeEvent.ChangeReason.DEATH) {
++                PlayerArmorChangeEvent event = weebFireArmorEvent(
++                        (EntityPlayer) this.player, armorIndex, oldItem, itemstack, reason);
++                if (event != null && event.isCancelled()) return;
++            }
+         }
++        // Sukkit end
+ 
+         aitemstack[i] = itemstack;
++
++        // Sukkit start - notify EntityPlayer to recompute WeebEffects immediately
++        if (armorIndex >= 0 && this.player instanceof EntityPlayer) {
++            ((EntityPlayer) this.player).onArmorSlotChanged();
++        }
++        // Sukkit end
++    }
++
++    // Sukkit start - helpers
++
++    /** Returns true if the NMS ItemStack carries the {@code WeebBinding} NBT byte. */
++    private static boolean weebHasBinding(ItemStack item) {
++        if (item == null) return false;
++        NBTTagCompound tag = item.getTag();
++        return tag != null && tag.getByte("WeebBinding") == 1;
+     }
+ 
++    /**
++     * Fires {@link PlayerArmorChangeEvent} and returns the event, or {@code null}
++     * if {@code player} is not yet fully initialised.
++     */
++    static PlayerArmorChangeEvent weebFireArmorEvent(EntityPlayer player, int armorIndex,
++            ItemStack oldNms, ItemStack newNms,
++            PlayerArmorChangeEvent.ChangeReason reason) {
++        if (player.getBukkitEntity() == null) return null;
++        org.bukkit.inventory.ItemStack oldBukkit =
++                (oldNms != null) ? CraftItemStack.asBukkitCopy(oldNms) : null;
++        org.bukkit.inventory.ItemStack newBukkit =
++                (newNms != null) ? CraftItemStack.asBukkitCopy(newNms) : null;
++        PlayerArmorChangeEvent event = new PlayerArmorChangeEvent(
++                player.getBukkitEntity(),
++                PlayerArmorChangeEvent.Slot.fromIndex(armorIndex),
++                oldBukkit, newBukkit, reason);
++        Bukkit.getPluginManager().callEvent(event);
++        return event;
++    }
++    // Sukkit end
++
+     public float a(Block block) {
+         float f = 1.0F;
+ 
+@@ -487,7 +566,16 @@ public class PlayerInventory implements IInventory {
+             if (this.armor[i] != null && this.armor[i].getItem() instanceof ItemArmor) {
+                 this.armor[i].damage((int) f, this.player);
+                 if (this.armor[i].count == 0) {
++                    // Sukkit start - armor break event (informational, already committed)
++                    ItemStack broken = this.armor[i];
+                     this.armor[i] = null;
++                    if (this.player instanceof EntityPlayer) {
++                        EntityPlayer ep = (EntityPlayer) this.player;
++                        weebFireArmorEvent(ep, i, broken, null,
++                                PlayerArmorChangeEvent.ChangeReason.BREAK);
++                        ep.onArmorSlotChanged();
++                    }
++                    // Sukkit end
+                 }
+             }
+         }
+@@ -506,8 +594,17 @@ public class PlayerInventory implements IInventory {
+ 
+         for (i = 0; i < this.armor.length; ++i) {
+             if (this.armor[i] != null) {
+-                this.player.a(this.armor[i], true, false);
++                // Sukkit start - armor death event (informational, not cancellable)
++                ItemStack dying = this.armor[i];
+                 this.armor[i] = null;
++                if (this.player instanceof EntityPlayer) {
++                    EntityPlayer ep = (EntityPlayer) this.player;
++                    weebFireArmorEvent(ep, i, dying, null,
++                            PlayerArmorChangeEvent.ChangeReason.DEATH);
++                    ep.onArmorSlotChanged();
++                }
++                this.player.a(dying, true, false);
++                // Sukkit end
+             }
+         }
+ 
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
+index 3e3a04808196e722fd1dcdae638bfcf45a79f4d9..3b9f22bd3145f1261b6f667c75ed49187f8431f0 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
+@@ -318,6 +318,16 @@ public class CraftLivingEntity extends CraftEntity implements LivingEntity {
+         return getHandle().hasEffect(MobEffectList.byId[type.getId()]);
+     }
+ 
++    public PotionEffect getPotionEffect(PotionEffectType type) {
++        MobEffect handle = getHandle().effects.get(type.getId());
++        if (handle == null) return null;
++        return new PotionEffect(
++            PotionEffectType.getById(handle.getEffectId()),
++            handle.getDuration(), handle.getAmplifier(),
++            handle.isAmbient(), handle.isShowParticles()
++        );
++    }
++
+     public void removePotionEffect(PotionEffectType type) {
+         getHandle().removeEffect(type.getId());
+     }
+diff --git a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+index 1705b5a51b37d45f3a6081f5e1f3688c436ce53d..1d8d60a7cccaa3a2ae86ce6934d63cada44d1e9e 100644
+--- a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
++++ b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
+@@ -346,6 +346,171 @@ public class CraftEventFactory {
+         return event;
+     }
+ 
++    /**
++     * PlayerReceiveDamageEvent
++     */
++    public static PlayerReceiveDamageEvent callPlayerReceiveDamageEvent(
++            EntityPlayer victim,
++            DamageSource source,
++            float rawDamage,
++            float hardHatModifier,
++            float blockingModifier,
++            float armorModifier,
++            float resistanceModifier,
++            float magicModifier,
++            float absorptionModifier) {
++
++        org.bukkit.entity.Player player = victim.getBukkitEntity();
++        org.bukkit.entity.Entity sourceEntity = (source.getEntity() != null)
++                ? source.getEntity().getBukkitEntity() : null;
++
++        // Reductions are stored as negative deltas in NMS; expose as positive amounts
++        float hardHat   = Math.max(0, -hardHatModifier);
++        float blocking  = Math.max(0, -blockingModifier);
++        float armor     = Math.max(0, -armorModifier);
++        float resistance = Math.max(0, -resistanceModifier);
++        float magic     = Math.max(0, -magicModifier);
++        float absorption = Math.max(0, -absorptionModifier);
++
++        boolean fromPlayer = source instanceof net.minecraft.server.PlayerAttackDamageSource;
++        net.minecraft.server.PlayerAttackDamageSource playerSrc =
++                fromPlayer ? (net.minecraft.server.PlayerAttackDamageSource) source : null;
++
++        // Build a lazy supplier for hit location — captured entities are NMS-safe, computation deferred
++        final net.minecraft.server.EntityPlayer nmsVictim = victim;
++        final net.minecraft.server.DamageSource capturedSource = source;
++        java.util.function.Supplier<PlayerReceiveDamageEvent.HitLocation> hitLocSupplier = () -> {
++            double hitY;
++            double victimFeetY  = nmsVictim.locY;
++            double victimHeight = nmsVictim.length; // 1.8 standing, 1.65 crouching
++
++            // ---- Arrow: use the projectile's exact impact position ----
++            if (capturedSource instanceof net.minecraft.server.EntityDamageSourceIndirect) {
++                net.minecraft.server.Entity projectile =
++                        ((net.minecraft.server.EntityDamageSourceIndirect) capturedSource).getProximateDamageSource();
++                if (projectile instanceof net.minecraft.server.EntityArrow) {
++                    hitY = projectile.locY;
++                } else {
++                    // Other projectile (fireball, snowball…): centre of the projectile
++                    hitY = (projectile != null)
++                            ? projectile.locY + projectile.length / 2.0
++                            : -1;
++                }
++            }
++            // ---- Melee: ray from attacker's eyes along their look direction ----
++            // The attacker's pitch encodes exactly where on the target they aimed:
++            //   hitY = eyeY − sin(pitch) × horizDist
++            // (pitch positive = looking down in MC → sin positive → hitY below eye)
++            //
++            // Examples (attacker & victim at same Y, horizDist ≈ 2 blocks):
++            //   pitch =   0° → hitY = eyeY (1.62)        → fraction 0.90 → HEAD
++            //   pitch =  15° → hitY = 1.62−0.52 = 1.10  → fraction 0.61 → TORSO
++            //   pitch =  30° → hitY = 1.62−1.00 = 0.62  → fraction 0.34 → LEGS
++            //   pitch = −15° (jumping over) → hitY = 2.14 → clamped → HEAD
++            else {
++                net.minecraft.server.Entity nmsAttacker = capturedSource.getEntity();
++                if (nmsAttacker == null) {
++                    return PlayerReceiveDamageEvent.HitLocation.UNKNOWN;
++                }
++                double eyeY    = nmsAttacker.locY + nmsAttacker.getHeadHeight();
++                double dxA     = nmsVictim.locX - nmsAttacker.locX;
++                double dzA     = nmsVictim.locZ - nmsAttacker.locZ;
++                double hDist   = Math.sqrt(dxA * dxA + dzA * dzA);
++                if (hDist < 0.01) {
++                    // Same position (edge case) — aim at victim's centre
++                    hitY = victimFeetY + victimHeight * 0.5;
++                } else {
++                    double pitchRad = nmsAttacker.pitch * Math.PI / 180.0;
++                    hitY = eyeY - Math.sin(pitchRad) * hDist;
++                }
++            }
++
++            if (hitY < 0) return PlayerReceiveDamageEvent.HitLocation.UNKNOWN;
++
++            // Map to body part using victim-height-relative thresholds.
++            // HEAD  ≥ 78 %  (neck/chin: ~1.4 / 1.8 = 77.8 %)
++            // TORSO ≥ 39 %  (waist:     ~0.7 / 1.8)
++            // LEGS  ≥ 11 %  (shins:     ~0.2 / 1.8)
++            // FEET  <  11 %
++            double relHit  = Math.max(0.0, Math.min(victimHeight, hitY - victimFeetY));
++            double fraction = relHit / victimHeight;
++            if (fraction >= 0.78)  return PlayerReceiveDamageEvent.HitLocation.HEAD;
++            if (fraction >= 0.389) return PlayerReceiveDamageEvent.HitLocation.TORSO;
++            if (fraction >= 0.111) return PlayerReceiveDamageEvent.HitLocation.LEGS;
++            return PlayerReceiveDamageEvent.HitLocation.FEET;
++        };
++
++        PlayerReceiveDamageEvent event = new PlayerReceiveDamageEvent(
++                player,
++                sourceEntity,
++                rawDamage,
++                hardHat, blocking, armor, resistance, magic, absorption,
++                fromPlayer,
++                fromPlayer ? playerSrc.getRawBaseDamage()        : 0f,
++                fromPlayer ? playerSrc.getEnchantmentBonus()     : 0f,
++                fromPlayer && playerSrc.isCritical(),
++                fromPlayer ? playerSrc.getCriticalMultiplier()   : 1.5f,
++                fromPlayer ? playerSrc.getKnockbackLevel()       : 0,
++                hitLocSupplier
++        );
++
++        Bukkit.getPluginManager().callEvent(event);
++        return event;
++    }
++
++    /**
++     * EntityThornsEvent — fired from {@link net.minecraft.server.EnchantmentThorns} before
++     * the reflected damage is rolled/applied. Neutral to vanilla when unmodified.
++     */
++    public static org.bukkit.event.entity.EntityThornsEvent callEntityThornsEvent(
++            EntityLiving wearer, net.minecraft.server.Entity attacker, int level,
++            float activationChance, float reflectedDamage) {
++        org.bukkit.entity.LivingEntity defender = (org.bukkit.entity.LivingEntity) wearer.getBukkitEntity();
++        org.bukkit.entity.Entity attackerBukkit = attacker != null ? attacker.getBukkitEntity() : null;
++        org.bukkit.event.entity.EntityThornsEvent event = new org.bukkit.event.entity.EntityThornsEvent(
++                defender, attackerBukkit, level, activationChance, reflectedDamage);
++        Bukkit.getPluginManager().callEvent(event);
++        return event;
++    }
++
++    /**
++     * PotionRemovedEvent
++     */
++    public static void callPotionRemovedEvent(EntityLiving receiver, net.minecraft.server.MobEffect nmsEffect) {
++        org.bukkit.entity.LivingEntity entity = (org.bukkit.entity.LivingEntity) receiver.getBukkitEntity();
++        org.bukkit.potion.PotionEffectType type = org.bukkit.potion.PotionEffectType.getById(nmsEffect.getEffectId());
++        org.bukkit.potion.PotionEffect effect = new org.bukkit.potion.PotionEffect(
++                type,
++                nmsEffect.getDuration(),
++                nmsEffect.getAmplifier(),
++                nmsEffect.isAmbient(),
++                nmsEffect.isShowParticles()
++        );
++        Bukkit.getPluginManager().callEvent(new org.bukkit.event.entity.PotionRemovedEvent(entity, effect));
++    }
++
++    /**
++     * PotionAddedEvent
++     */
++    public static PotionAddedEvent callPotionAddedEvent(EntityLiving receiver, net.minecraft.server.MobEffect nmsEffect) {
++        org.bukkit.entity.LivingEntity entity = (org.bukkit.entity.LivingEntity) receiver.getBukkitEntity();
++        net.minecraft.server.Entity nmsSource = nmsEffect.getSource();
++        org.bukkit.entity.Entity source = nmsSource != null ? nmsSource.getBukkitEntity() : null;
++
++        org.bukkit.potion.PotionEffectType type = org.bukkit.potion.PotionEffectType.getById(nmsEffect.getEffectId());
++        org.bukkit.potion.PotionEffect effect = new org.bukkit.potion.PotionEffect(
++                type,
++                nmsEffect.getDuration(),
++                nmsEffect.getAmplifier(),
++                nmsEffect.isAmbient(),
++                nmsEffect.isShowParticles()
++        );
++
++        PotionAddedEvent event = new PotionAddedEvent(entity, effect, source);
++        Bukkit.getPluginManager().callEvent(event);
++        return event;
++    }
++
+     /**
+      * BlockFadeEvent
+      */
+diff --git a/src/main/java/org/bukkit/craftbukkit/fakeplayer/FakePlayerManager.java b/src/main/java/org/bukkit/craftbukkit/fakeplayer/FakePlayerManager.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..5cc782895ef0eaf3a97fdba59ca4bfec2b97f441
+--- /dev/null
++++ b/src/main/java/org/bukkit/craftbukkit/fakeplayer/FakePlayerManager.java
+@@ -0,0 +1,541 @@
++package org.bukkit.craftbukkit.fakeplayer;
++
++import java.util.Collections;
++import java.util.Map;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++import net.minecraft.server.EntityFakePlayer;
++import net.minecraft.server.EntityLiving;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.WorldServer;
++import org.bukkit.Bukkit;
++import org.bukkit.Location;
++import org.bukkit.craftbukkit.CraftServer;
++import org.bukkit.craftbukkit.CraftWorld;
++import org.bukkit.craftbukkit.entity.CraftEntity;
++import org.bukkit.craftbukkit.entity.CraftPlayer;
++import org.bukkit.entity.Entity;
++import org.bukkit.entity.LivingEntity;
++import org.bukkit.entity.Player;
++import org.spigotmc.AsyncCatcher;
++
++/**
++ * Factory and lifecycle manager for {@link EntityFakePlayer} instances.
++ *
++ * <p>Fake players are server-controlled {@code EntityPlayer} entities that
++ * appear as player skins to clients.  They can operate in two modes:</p>
++ * <ul>
++ *   <li>{@link Mode#NPC} — static entity, does not move or attack.</li>
++ *   <li>{@link Mode#COMBAT} — pursues and melee-attacks a target entity.</li>
++ * </ul>
++ *
++ * <h3>Usage (plugin side)</h3>
++ * <pre>{@code
++ * import org.bukkit.craftbukkit.fakeplayer.FakePlayerManager;
++ * import org.bukkit.craftbukkit.fakeplayer.FakePlayerManager.Mode;
++ *
++ * // Spawn an NPC at the given location
++ * Player npc = FakePlayerManager.spawn(location, "Dummy");
++ *
++ * // Make it attack a real player
++ * FakePlayerManager.setTarget(npc, realPlayer);
++ *
++ * // Or change mode directly
++ * FakePlayerManager.setMode(npc, Mode.COMBAT);
++ *
++ * // Remove when done
++ * FakePlayerManager.remove(npc);
++ * }</pre>
++ *
++ * <h3>Thread safety</h3>
++ * All public methods enforce main-thread execution via
++ * {@link AsyncCatcher#catchOp(String)}.  The internal registry is a
++ * {@link ConcurrentHashMap} for safe iteration from other threads.
++ */
++public final class FakePlayerManager {
++
++    private FakePlayerManager() {}
++
++    /** Operating mode for fake players. */
++    public enum Mode {
++        /** Static — entity does not move or attack; takes damage normally. */
++        NPC,
++        /**
++         * Fully static display entity — immune to all entity-sourced damage
++         * (melee, arrows, explosions) and knockback.  Environmental damage
++         * (fall, fire, void) is unaffected.
++         */
++        NO_AI,
++        /** Combat bot — pursues and attacks the assigned target. */
++        COMBAT
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Internal registry
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * UUID → EntityFakePlayer map.
++     * Allows O(1) lookup, safe concurrent read from async plugins.
++     */
++    private static final Map<UUID, EntityFakePlayer> REGISTRY =
++            new ConcurrentHashMap<>();
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Lifecycle
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Spawns a fake player at the given location in NPC mode with a preset
++     * number of golden apples for autonomous self-healing.
++     *
++     * <p>The entity is immediately visible to nearby real players.  Its
++     * {@link Mode} defaults to {@link Mode#NPC}.</p>
++     *
++     * @param location    spawn location (must be in a loaded chunk)
++     * @param name        display name shown in the tab list (max 16 chars)
++     * @param gappleCount initial number of golden apples (≥ 0)
++     * @return the Bukkit {@link Player} handle wrapping the fake entity
++     * @throws IllegalStateException if the chunk at location is not loaded
++     */
++    public static Player spawn(Location location, String name, int gappleCount) {
++        AsyncCatcher.catchOp("FakePlayerManager.spawn");
++
++        WorldServer worldServer = ((CraftWorld) location.getWorld()).getHandle();
++        MinecraftServer minecraftServer = ((CraftServer) Bukkit.getServer()).getServer();
++
++        EntityFakePlayer entity = new EntityFakePlayer(minecraftServer, worldServer, name,
++                                                       Math.max(0, gappleCount));
++        entity.setPositionRotation(
++                location.getX(), location.getY(), location.getZ(),
++                location.getYaw(), location.getPitch());
++
++        // FakePlayerSpawnEvent — cancellable; return null if a plugin vetoes.
++        org.bukkit.event.fakeplayer.FakePlayerSpawnEvent spawnEvent =
++                new org.bukkit.event.fakeplayer.FakePlayerSpawnEvent(
++                        (Player) entity.getBukkitEntity(), location);
++        Bukkit.getPluginManager().callEvent(spawnEvent);
++        if (spawnEvent.isCancelled()) return null;
++
++        boolean added = worldServer.addEntity(entity);
++        if (!added) {
++            throw new IllegalStateException(
++                    "Could not add EntityFakePlayer to world at " + location
++                    + " — is the chunk loaded?");
++        }
++
++        REGISTRY.put(entity.getUniqueID(), entity);
++        return (Player) entity.getBukkitEntity();
++    }
++
++    /**
++     * Spawns a fake player with no golden apples (convenience overload).
++     *
++     * @param location spawn location (must be in a loaded chunk)
++     * @param name     display name shown in the tab list (max 16 chars)
++     * @return the Bukkit {@link Player} handle wrapping the fake entity
++     */
++    public static Player spawn(Location location, String name) {
++        return spawn(location, name, 0);
++    }
++
++    /**
++     * Removes (despawns) a fake player from the world.
++     *
++     * <p>The entity is cleanly removed via {@link net.minecraft.server.World#kill},
++     * which unregisters it from the entity tracker (sending a removal packet to
++     * nearby clients) and removes it from {@code world.players}.</p>
++     *
++     * @param fakePlayer the player handle returned by {@link #spawn}
++     * @throws IllegalArgumentException if the entity is not a registered fake player
++     */
++    public static void remove(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.remove");
++
++        EntityFakePlayer entity = getNmsEntity(fakePlayer);
++        REGISTRY.remove(entity.getUniqueID());
++        entity.world.kill(entity);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Mode & target control
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Changes the operating mode of a fake player.
++     *
++     * @param fakePlayer the fake player handle
++     * @param mode       the desired mode
++     */
++    public static void setMode(Player fakePlayer, Mode mode) {
++        AsyncCatcher.catchOp("FakePlayerManager.setMode");
++        getNmsEntity(fakePlayer).setFakeMode(toNmsMode(mode));
++    }
++
++    /** Returns the current mode of a fake player. */
++    public static Mode getMode(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.getMode");
++        return fromNmsMode(getNmsEntity(fakePlayer).getFakeMode());
++    }
++
++    /**
++     * Assigns a combat target to a fake player and switches it to
++     * {@link Mode#COMBAT}.  Pass {@code null} to clear the target.
++     *
++     * @param fakePlayer the fake player handle
++     * @param target     entity to attack, or {@code null} to stop attacking
++     */
++    public static void setTarget(Player fakePlayer, LivingEntity target) {
++        AsyncCatcher.catchOp("FakePlayerManager.setTarget");
++        EntityLiving nmsTarget = (target != null)
++                ? (EntityLiving) ((CraftEntity) target).getHandle()
++                : null;
++        getNmsEntity(fakePlayer).setCombatTarget(nmsTarget);
++    }
++
++    /** Returns the current combat target, or {@code null} if none. */
++    public static LivingEntity getTarget(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.getTarget");
++        EntityLiving nms = getNmsEntity(fakePlayer).getCombatTarget();
++        if (nms == null) return null;
++        org.bukkit.entity.Entity bukkit = nms.getBukkitEntity();
++        return (bukkit instanceof LivingEntity) ? (LivingEntity) bukkit : null;
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Golden apple / eating
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Sets the number of golden apples available to a fake player for
++     * autonomous self-healing.
++     *
++     * @param fakePlayer the fake player handle
++     * @param count      non-negative apple count
++     */
++    public static void setGappleCount(Player fakePlayer, int count) {
++        AsyncCatcher.catchOp("FakePlayerManager.setGappleCount");
++        getNmsEntity(fakePlayer).setGappleCount(count);
++    }
++
++    /** Returns the current number of golden apples remaining. */
++    public static int getGappleCount(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.getGappleCount");
++        return getNmsEntity(fakePlayer).getGappleCount();
++    }
++
++    /**
++     * Returns {@code true} while the fake player is mid-eating animation
++     * (32-tick window).
++     */
++    public static boolean isEating(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.isEating");
++        return getNmsEntity(fakePlayer).isEating();
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Water clutch / fire extinguish
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Returns {@code true} while the fake player is executing a water-clutch
++     * sequence (bucket hold → place → remove).
++     */
++    public static boolean isPlacingWater(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.isPlacingWater");
++        return getNmsEntity(fakePlayer).isPlacingWater();
++    }
++
++    /**
++     * Returns the ticks remaining before the next water clutch is allowed.
++     * 0 means the bot can clutch immediately (subject to fire/ground checks).
++     */
++    public static int getWaterCooldown(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.getWaterCooldown");
++        return getNmsEntity(fakePlayer).getWaterCooldown();
++    }
++
++    /**
++     * Resets the water-clutch cooldown to zero so the bot can extinguish
++     * itself on the very next fire tick without waiting 5 seconds.
++     *
++     * @param fakePlayer the fake player handle
++     */
++    public static void resetWaterCooldown(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.resetWaterCooldown");
++        getNmsEntity(fakePlayer).resetWaterCooldown();
++    }
++
++    /** Returns {@code true} if water-clutch self-extinguish is enabled for this bot. */
++    public static boolean isWaterEnabled(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.isWaterEnabled");
++        return getNmsEntity(fakePlayer).isWaterEnabled();
++    }
++
++    /**
++     * Enables or disables the water-clutch mechanic.
++     * If disabled mid-sequence, the placed water block is immediately removed.
++     */
++    public static void setWaterEnabled(Player fakePlayer, boolean enabled) {
++        AsyncCatcher.catchOp("FakePlayerManager.setWaterEnabled");
++        getNmsEntity(fakePlayer).setWaterEnabled(enabled);
++    }
++
++    /**
++     * Returns the per-bot cooldown between water clutches in ticks.
++     * Default: 100 ticks (5 s).
++     */
++    public static int getWaterCooldownDuration(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.getWaterCooldownDuration");
++        return getNmsEntity(fakePlayer).getWaterCooldownDuration();
++    }
++
++    /**
++     * Sets the cooldown between water clutches for this specific bot.
++     *
++     * @param fakePlayer the fake player handle
++     * @param ticks      non-negative tick count; 0 = no cooldown
++     */
++    public static void setWaterCooldownDuration(Player fakePlayer, int ticks) {
++        AsyncCatcher.catchOp("FakePlayerManager.setWaterCooldownDuration");
++        getNmsEntity(fakePlayer).setWaterCooldownDuration(ticks);
++    }
++
++    /**
++     * Returns how many ticks the water block stays active when the bot is in lava.
++     * Default: 60 ticks (3 s).
++     */
++    public static int getWaterLavaStayTicks(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.getWaterLavaStayTicks");
++        return getNmsEntity(fakePlayer).getWaterLavaStayTicks();
++    }
++
++    /**
++     * Sets how long (ticks) the water source block stays on the ground when
++     * the bot's feet or head are in lava.
++     *
++     * @param fakePlayer the fake player handle
++     * @param ticks      minimum 1 tick; increase for deep lava pools
++     */
++    public static void setWaterLavaStayTicks(Player fakePlayer, int ticks) {
++        AsyncCatcher.catchOp("FakePlayerManager.setWaterLavaStayTicks");
++        getNmsEntity(fakePlayer).setWaterLavaStayTicks(ticks);
++    }
++
++    /**
++     * Sets the fake player on fire, triggering the water-clutch AI when
++     * it next ticks (if cooldown is 0 and ground conditions allow).
++     *
++     * @param fakePlayer the fake player handle
++     * @param seconds    duration in seconds (vanilla: each second adds 20 ticks)
++     */
++    public static void setOnFire(Player fakePlayer, int seconds) {
++        AsyncCatcher.catchOp("FakePlayerManager.setOnFire");
++        getNmsEntity(fakePlayer).setOnFire(seconds);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Inventory
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Sets the item held in the fake player's main hand.
++     *
++     * <p>Use this to give the bot a weapon (e.g. a diamond sword) so that its
++     * melee attacks deal weapon-level damage.  The item is set directly in the
++     * inventory slot; no pickup event is fired.</p>
++     *
++     * <p>Pass {@code null} (or {@link org.bukkit.Material#AIR}) to clear the
++     * hand slot.</p>
++     *
++     * @param fakePlayer the fake player handle
++     * @param item       the Bukkit item to place in hand, or {@code null} to clear
++     */
++    public static void setItemInHand(Player fakePlayer,
++                                     org.bukkit.inventory.ItemStack item) {
++        AsyncCatcher.catchOp("FakePlayerManager.setItemInHand");
++        EntityFakePlayer entity = getNmsEntity(fakePlayer);
++        net.minecraft.server.ItemStack nmsItem =
++                (item == null || item.getType() == org.bukkit.Material.AIR)
++                ? null
++                : org.bukkit.craftbukkit.inventory.CraftItemStack.asNMSCopy(item);
++        entity.inventory.setItem(entity.inventory.itemInHandIndex, nmsItem);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Reach
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Returns this bot's melee reach in blocks (default 3.5).
++     *
++     * @param fakePlayer the fake player handle
++     * @return reach in blocks
++     */
++    public static double getAttackRange(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.getAttackRange");
++        return getNmsEntity(fakePlayer).getAttackRange();
++    }
++
++    /**
++     * Sets the per-clone melee reach.
++     *
++     * <p>Clamped to [0.5, 20] blocks.  Changes both the damage window in
++     * {@code tryAttack()} and the "out-of-range" threshold used by swimming
++     * and airborne movement.</p>
++     *
++     * @param fakePlayer the fake player handle
++     * @param blocks     positive reach in blocks
++     */
++    public static void setAttackRange(Player fakePlayer, double blocks) {
++        AsyncCatcher.catchOp("FakePlayerManager.setAttackRange");
++        getNmsEntity(fakePlayer).setAttackRange(blocks);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Skin
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Sets a custom skin on this bot from a Minecraft texture URL.
++     *
++     * <p>The textures JSON is built and Base64-encoded internally — no Mojang
++     * signature is included.  Works on offline-mode / Bungeecord servers.
++     * For online-mode servers use {@link #setSkinRaw} with a pre-signed property
++     * from the Mojang session API.</p>
++     *
++     * <p>If the bot is already in the world, nearby observers see the change
++     * immediately (brief despawn/respawn flicker).</p>
++     *
++     * @param fakePlayer the fake player handle
++     * @param skinUrl    Minecraft texture URL (e.g. {@code http://textures.minecraft.net/texture/abc123})
++     * @param slim       {@code true} for the Alex model (slim arms), {@code false} for Steve
++     * @param capeUrl    Cape texture URL, or {@code null} / {@code ""} for no cape
++     */
++    public static void setSkin(Player fakePlayer, String skinUrl, boolean slim, String capeUrl) {
++        AsyncCatcher.catchOp("FakePlayerManager.setSkin");
++        getNmsEntity(fakePlayer).setSkin(skinUrl, slim, capeUrl);
++    }
++
++    /**
++     * Convenience overload — sets a skin without a cape.
++     *
++     * @param fakePlayer the fake player handle
++     * @param skinUrl    Minecraft texture URL
++     * @param slim       {@code true} for Alex, {@code false} for Steve
++     */
++    public static void setSkin(Player fakePlayer, String skinUrl, boolean slim) {
++        setSkin(fakePlayer, skinUrl, slim, null);
++    }
++
++    /**
++     * Installs a pre-signed skin from a Mojang session API response.
++     *
++     * <p>Use this in online-mode when clients verify the Mojang RSA signature.
++     * {@code value} and {@code signature} are the strings returned by
++     * {@code GET https://sessionserver.mojang.com/session/minecraft/profile/UUID?unsigned=false}.</p>
++     *
++     * @param fakePlayer the fake player handle
++     * @param value      Base64-encoded textures JSON (Mojang {@code value} field)
++     * @param signature  RSA-SHA1 signature (Mojang {@code signature} field), or {@code null}
++     */
++    public static void setSkinRaw(Player fakePlayer, String value, String signature) {
++        AsyncCatcher.catchOp("FakePlayerManager.setSkinRaw");
++        getNmsEntity(fakePlayer).setSkinRaw(value, signature);
++    }
++
++    /**
++     * Removes the custom skin, restoring the default Steve appearance.
++     *
++     * @param fakePlayer the fake player handle
++     */
++    public static void clearSkin(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.clearSkin");
++        getNmsEntity(fakePlayer).clearSkin();
++    }
++
++    /** Returns {@code true} if a custom skin is installed on this bot. */
++    public static boolean hasSkin(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.hasSkin");
++        return getNmsEntity(fakePlayer).hasSkin();
++    }
++
++    /**
++     * Returns the Base64-encoded textures property value currently on this bot's
++     * profile, or {@code null} if no custom skin is installed.
++     */
++    public static String getSkinTextureValue(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.getSkinTextureValue");
++        return getNmsEntity(fakePlayer).getSkinTextureValue();
++    }
++
++    /**
++     * Returns {@code true} if the current skin uses the Alex (slim-arm) model.
++     * Only reliable when the skin was set via {@link #setSkin}.
++     */
++    public static boolean isSkinSlim(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.isSkinSlim");
++        return getNmsEntity(fakePlayer).isSkinSlim();
++    }
++
++    /**
++     * Returns the cape URL embedded in the current skin, or {@code null}.
++     * Only reliable when the skin was set via {@link #setSkin}.
++     */
++    public static String getCapeTextureUrl(Player fakePlayer) {
++        AsyncCatcher.catchOp("FakePlayerManager.getCapeTextureUrl");
++        return getNmsEntity(fakePlayer).getCapeTextureUrl();
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Query utilities
++    // ─────────────────────────────────────────────────────────────────────────
++
++    /**
++     * Returns {@code true} if the given entity is a registered fake player.
++     */
++    public static boolean isFakePlayer(Entity entity) {
++        if (!(entity instanceof Player)) return false;
++        return REGISTRY.containsKey(entity.getUniqueId());
++    }
++
++    /**
++     * Returns an unmodifiable view of all currently registered fake player
++     * UUIDs.
++     */
++    public static Map<UUID, ?> getRegisteredFakePlayers() {
++        return Collections.unmodifiableMap(REGISTRY);
++    }
++
++    // ─────────────────────────────────────────────────────────────────────────
++    // Internal helpers
++    // ─────────────────────────────────────────────────────────────────────────
++
++    private static EntityFakePlayer getNmsEntity(Player player) {
++        UUID uuid = player.getUniqueId();
++        EntityFakePlayer entity = REGISTRY.get(uuid);
++        if (entity == null) {
++            throw new IllegalArgumentException(
++                    "Entity " + uuid + " is not a registered FakePlayer");
++        }
++        return entity;
++    }
++
++    private static EntityFakePlayer.Mode toNmsMode(Mode mode) {
++        switch (mode) {
++            case NPC:    return EntityFakePlayer.Mode.NPC;
++            case NO_AI:  return EntityFakePlayer.Mode.NO_AI;
++            case COMBAT: return EntityFakePlayer.Mode.COMBAT;
++            default: throw new IllegalArgumentException("Unknown mode: " + mode);
++        }
++    }
++
++    private static Mode fromNmsMode(EntityFakePlayer.Mode mode) {
++        switch (mode) {
++            case NPC:    return Mode.NPC;
++            case NO_AI:  return Mode.NO_AI;
++            case COMBAT: return Mode.COMBAT;
++            default: throw new IllegalArgumentException("Unknown mode: " + mode);
++        }
++    }
++}
